@@ -56,6 +56,16 @@
 - `forwarding.secret`、RCON 密码、CurseForge API Key 等属于凭据，不要提交公开仓库。
 - 剧情/人物/势力等创作内容的版权合规由项目组确认；模组/资源包遵循各自许可。
 
+## 推送到 GitHub
+
+仓库：**`Yunmoan/craft-workshop`**（public）。本地已初始化并提交，授权后一键推送：
+
+```bash
+./scripts/push-github.sh
+```
+
+登录/授权步骤见 [docs/PUBLISH.md](docs/PUBLISH.md)（SSH 公钥已生成在 `.gitkeys/`，勿提交私钥）。
+
 ## 下一步
 
 见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。近期优先：

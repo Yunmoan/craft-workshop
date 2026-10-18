@@ -1,0 +1,32 @@
+{
+  "id": "chapter-01",
+  "title": "第一章 · 示例任务线",
+  "order": 1,
+  "group": "main",
+  "icon": "minecraft:written_book",
+  "description": "任务章节简介",
+  "quests": [
+    {
+      "id": "q-001",
+      "title": "苏醒",
+      "subtitle": "",
+      "description": "与神秘来客对话。",
+      "x": 0,
+      "y": 0,
+      "shape": "circle",
+      "size": 1,
+      "dependencies": [],
+      "tasks": [
+        {
+          "type": "checkmark"
+        }
+      ],
+      "rewards": [
+        {
+          "type": "xp",
+          "xp": 10
+        }
+      ]
+    }
+  ]
+}

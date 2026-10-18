@@ -1,0 +1,5 @@
+# CraftWorkshop UI — the browser half of 方块工坊.
+# The Host data route is served by @ipthmc/craft-workshop (/craft-workshop/api/state).
+- insert:
+    - id: craft-workshop-ui
+      name: '@ipthmc/craft-workshop-ui'

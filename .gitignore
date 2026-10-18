@@ -1,0 +1,18 @@
+# DSH / Node
+node_modules/
+.DS_Store
+*.log
+
+# 生成的整合包与导出（可由工具重建）
+build/
+builds/
+build/exports/
+
+# 服务端/代理运行目录（含 eula、forwarding.secret 等本机凭据）
+server/
+proxy/
+
+# 本机凭据
+.gitkeys/
+*.secret
+forwarding.secret

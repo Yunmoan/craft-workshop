@@ -1,0 +1,1397 @@
+/**
+ * CraftWorkshop（方块工坊）— IPTHMC 社团的 Minecraft 运营 Host 插件。
+ *
+ * Registers model-facing tools for:
+ *  - Modrinth resource search / project & version inspection
+ *  - dependency resolution for a target Minecraft version + loader
+ *  - .mrpack modpack generation
+ *  - NeoForge / Fabric / Paper / Velocity / Arclight server configuration generation
+ *  - Java server status ping (Server List Ping)
+ *  - modpack ↔ server mod directory consistency checks
+ */
+import { mkdir, readFile, readdir, stat } from 'node:fs/promises'
+import { isAbsolute, join, resolve as resolvePath } from 'node:path'
+import { formatBytes, formatDate, formatTable, truncate } from './src/util.js'
+import {
+  dependencySummary,
+  getProject,
+  getProjectVersions,
+  getVersion,
+  resolvePlan,
+  searchProjects,
+} from './src/modrinth.js'
+import { LOADER_KINDS, loaderInfo } from './src/loaders.js'
+import { buildMrpack, installMrpackToServer, readMrpack, serverFilesOf, walkFiles } from './src/mrpack.js'
+import { SERVER_KINDS, generateServerConfig } from './src/servercfg.js'
+import { pingServer, resolveMinecraftSrv } from './src/ping.js'
+import {
+  DESIGN_KINDS,
+  DESIGN_KIND_NAMES,
+  checkDesign,
+  deleteEntry,
+  ensureDesignScaffold,
+  exportDesignWiki,
+  getEntry,
+  listEntries,
+  writeEntry,
+} from './src/design.js'
+import { exportFtbQuests, exportKubeJs, exportPatchouli } from './src/exporters.js'
+import {
+  addMods,
+  buildFromProject,
+  defaultProject,
+  pinMod,
+  projectSummary,
+  readProject,
+  removeMods,
+  resolveProject,
+  unpinMod,
+  writeProject,
+} from './src/project.js'
+
+export const inject = ['tools']
+
+const DEFAULTS = {
+  userAgent: 'craft-workshop/0.3.0 (https://ipthmc.zyghit.cn)',
+  defaultGameVersion: '1.21.1',
+  defaultLoader: 'neoforge',
+  defaultOutputRoot: '',
+  cacheTtlSeconds: 600,
+  requestTimeoutMs: 20000,
+  maxDependencyDepth: 6,
+  curseForgeApiKey: '',
+  projectFile: 'project.json',
+  designRoot: 'design',
+  defaultNamespace: 'ipthmc',
+}
+
+const PROJECT_TYPES = ['mod', 'plugin', 'modpack', 'resourcepack', 'shader', 'datapack']
+const SORT_INDEXES = ['relevance', 'downloads', 'follows', 'newest', 'updated']
+const LOADER_ENUM = [...new Set([...LOADER_KINDS.slice(1), 'forge', 'quilt', 'paper', 'purpur', 'velocity', 'folia', 'waterfall', 'bungeecord', 'spigot', 'bukkit'])]
+
+function fillDefaults(config) {
+  const merged = { ...DEFAULTS }
+  for (const [key, value] of Object.entries(config ?? {})) {
+    if (value !== undefined) merged[key] = value
+  }
+  return merged
+}
+
+function slugify(text) {
+  return String(text ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64) || 'ipthmc-pack'
+}
+
+function sideText(entry) {
+  const client = entry.clientSide ?? '?'
+  const server = entry.serverSide ?? '?'
+  return `${client}/${server}`
+}
+
+function textBlocks(text) {
+  return [{ type: 'text', text }]
+}
+
+/** Canonical tool values must be lossless JSON: drop undefined/function fields and normalize specials. */
+function toLosslessJson(value) {
+  if (value === undefined) return null
+  return JSON.parse(JSON.stringify(value))
+}
+
+function defineTool(definition) {
+  return {
+    name: definition.name,
+    description: definition.description,
+    parameters: definition.parameters,
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (args, value) => textBlocks(definition.render(args, value)),
+    },
+    execute: async (args, exec) => toLosslessJson(await definition.execute(args, exec)),
+  }
+}
+
+/**
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {object} rawConfig plugin row config
+ */
+export function apply(ctx, rawConfig) {
+  const config = fillDefaults(rawConfig)
+
+  /**
+   * Resolve the calling session's effective working directory. Global tools run for
+   * every agent, so the directory must come from the agent of the current call rather
+   * than from the Host process cwd.
+   */
+  let lastWorkspaceRoot = ''
+  const sessionRoot = async (exec) => {
+    if (config.defaultOutputRoot) {
+      lastWorkspaceRoot = String(config.defaultOutputRoot)
+      return lastWorkspaceRoot
+    }
+    try {
+      const workingDirectory = typeof ctx.get === 'function' ? ctx.get('workingDirectory') : undefined
+      if (workingDirectory?.ensure && exec?.agent) {
+        lastWorkspaceRoot = await workingDirectory.ensure(exec.agent, exec.signal)
+        return lastWorkspaceRoot
+      }
+      if (workingDirectory?.defaultDirectory) {
+        lastWorkspaceRoot = workingDirectory.defaultDirectory
+        return lastWorkspaceRoot
+      }
+    } catch {
+      /* fall through to process cwd */
+    }
+    lastWorkspaceRoot = process.cwd()
+    return lastWorkspaceRoot
+  }
+
+  const outPath = (root, value, fallback) => {
+    const raw = String(value ?? fallback ?? '').trim()
+    if (!raw) throw new Error('缺少输出路径（output / dir）')
+    return isAbsolute(raw) ? raw : resolvePath(root, raw)
+  }
+
+  /** Absolute path of the project file for one call. */
+  const projectFileFor = async (exec, pathArg) => {
+    const root = await sessionRoot(exec)
+    return { root, file: outPath(root, pathArg ?? config.projectFile) }
+  }
+
+  /** Absolute design root: explicit override > project.json design.root > plugin config. */
+  const designRootFor = async (root, projectFile, override) => {
+    if (override) return outPath(root, override)
+    try {
+      const project = await readProject(projectFile)
+      return resolvePath(root, project.design?.root ?? config.designRoot)
+    } catch {
+      return resolvePath(root, config.designRoot)
+    }
+  }
+
+  const projectPaths = async (exec, pathArg) => {
+    const { root, file } = await projectFileFor(exec, pathArg)
+    return { root, file, designRoot: await designRootFor(root, file) }
+  }
+
+  // ---------------------------------------------------------------------------
+  // mc_search
+  // ---------------------------------------------------------------------------
+  const searchTool = defineTool({
+    name: 'mc_search',
+    description:
+      '搜索 Modrinth 资源（自动带 Minecraft 版本/加载器过滤）。默认使用插件配置的目标版本（' +
+      `${config.defaultGameVersion}/${config.defaultLoader}）。` +
+      '返回 slug、下载量、更新日期、客户端/服务端支持与简介；slug 可直接用于 mc_project、mc_resolve、mc_pack。',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '搜索关键词；留空则按下载量浏览热门资源' },
+        projectType: { type: 'string', enum: PROJECT_TYPES, description: '资源类型，默认 mod' },
+        loaders: {
+          type: 'array',
+          items: { type: 'string', enum: LOADER_ENUM },
+          description: '加载器过滤，如 ["neoforge"]；mod/modpack 默认使用插件配置的加载器',
+        },
+        gameVersions: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Minecraft 版本过滤，如 ["1.21.1"]；默认使用插件配置的目标版本',
+        },
+        limit: { type: 'integer', minimum: 1, maximum: 100, description: '每页条数，默认 10' },
+        offset: { type: 'integer', minimum: 0, description: '分页偏移，默认 0' },
+        sortBy: { type: 'string', enum: SORT_INDEXES, description: '排序：relevance/downloads/follows/newest/updated，默认 relevance' },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const projectType = args.projectType ?? 'mod'
+      const useDefaultLoader = projectType === 'mod' || projectType === 'modpack'
+      const loaders = args.loaders?.length
+        ? args.loaders
+        : useDefaultLoader && config.defaultLoader
+          ? [config.defaultLoader]
+          : []
+      const gameVersions = args.gameVersions?.length ? args.gameVersions : [config.defaultGameVersion]
+      const limit = args.limit ?? 10
+      const offset = args.offset ?? 0
+      const result = await searchProjects(
+        config,
+        {
+          query: args.query ?? '',
+          projectType,
+          loaders,
+          gameVersions,
+          limit,
+          offset,
+          index: args.sortBy ?? 'relevance',
+        },
+        exec.signal,
+      )
+      const rows = result.hits.map((hit) => [
+        hit.slug,
+        truncate(hit.title, 26),
+        hit.downloads,
+        formatDate(hit.updated),
+        sideText(hit),
+        truncate(hit.description, 46),
+      ])
+      const lines = [
+        `Modrinth 搜索：${args.query ? `「${args.query}」` : '（热门浏览）'} | 类型 ${projectType} | 版本 ${gameVersions.join(',') || '不限'} | 加载器 ${loaders.join(',') || '不限'}`,
+        `共命中 ${result.totalHits} 个，本次显示 ${offset + 1}-${offset + rows.length} 条`,
+        '',
+        formatTable(['slug', '标题', '下载', '更新', '客户端/服务端', '简介'], rows),
+        '',
+        '下一步：mc_resource 查看详情；mc_resolve 解析依赖；mc_build 从工程构建整合包。',
+      ]
+      return {
+        tool: 'mc_search',
+        query: args.query ?? '',
+        projectType,
+        loaders,
+        gameVersions,
+        totalHits: result.totalHits,
+        hits: result.hits,
+        text: lines.join('\n'),
+      }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  // ---------------------------------------------------------------------------
+  // mc_project
+  // ---------------------------------------------------------------------------
+  const resourceTool = defineTool({
+    name: 'mc_resource',
+    description:
+      '查看一个 Modrinth 资源项目的详情与兼容版本列表（按 Minecraft 版本 + 加载器过滤），' +
+      '包含下载直链、sha1/sha512、依赖列表与客户端/服务端支持情况。',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '项目 slug 或 project id，例如 "sodium"' },
+        gameVersions: { type: 'array', items: { type: 'string' }, description: 'Minecraft 版本过滤，默认使用插件目标版本' },
+        loaders: { type: 'array', items: { type: 'string', enum: LOADER_ENUM }, description: '加载器过滤，默认使用插件目标加载器' },
+        versionLimit: { type: 'integer', minimum: 1, maximum: 50, description: '最多显示多少个版本，默认 10' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const project = await getProject(config, args.id, exec.signal)
+      const gameVersions = args.gameVersions?.length ? args.gameVersions : [config.defaultGameVersion]
+      const loaders = args.loaders?.length ? args.loaders : [config.defaultLoader]
+      const versionLimit = args.versionLimit ?? 10
+      let versions = await getProjectVersions(config, project.id, { gameVersions, loaders }, exec.signal)
+      let filterNote = `筛选：Minecraft ${gameVersions.join(',')} / ${loaders.join(',')}`
+      if (!versions.length) {
+        versions = await getProjectVersions(config, project.id, {}, exec.signal)
+        filterNote = '没有匹配当前版本/加载器的版本，以下显示该项目的全部版本'
+      }
+      const shown = versions.slice(0, versionLimit)
+      const rows = shown.map((version) => {
+        const file = (version.files ?? []).find((item) => item.primary) ?? version.files?.[0]
+        return [
+          truncate(version.version_number, 20),
+          version.version_type,
+          formatDate(version.date_published),
+          file?.filename ?? '?',
+          formatBytes(file?.size),
+          dependencySummary(version),
+        ]
+      })
+      const latest = versions[0]
+      const latestFile = (latest?.files ?? []).find((item) => item.primary) ?? latest?.files?.[0]
+      const lines = [
+        `项目：${project.title}（${project.slug}）  id: ${project.id}`,
+        `类型：${project.project_type} | 客户端：${project.client_side} | 服务端：${project.server_side} | 下载：${project.downloads} | 更新：${formatDate(project.updated)}`,
+        `简介：${truncate(project.description, 300)}`,
+        latestFile ? `最新版本文件：${latestFile.filename}（${formatBytes(latestFile.size)}）` : '',
+        latestFile ? `下载直链：${latestFile.url}` : '',
+        '',
+        `${filterNote}，共 ${versions.length} 个版本，显示 ${shown.length} 个：`,
+        formatTable(['版本号', '类型', '发布日期', '文件名', '大小', '依赖'], rows),
+        '',
+        latestFile ? `注意：版本对象里 sha1=${latestFile.hashes?.sha1 ?? '?'}，sha512=${latestFile.hashes?.sha512?.slice(0, 16) ?? '?'}…` : '',
+      ].filter(Boolean)
+      return {
+        tool: 'mc_project',
+        project: {
+          id: project.id,
+          slug: project.slug,
+          title: project.title,
+          projectType: project.project_type,
+          clientSide: project.client_side,
+          serverSide: project.server_side,
+          downloads: project.downloads,
+          updated: project.updated,
+        },
+        versions: shown.map((version) => ({
+          versionId: version.id,
+          versionNumber: version.version_number,
+          versionType: version.version_type,
+          gameVersions: version.game_versions,
+          loaders: version.loaders,
+          datePublished: version.date_published,
+          filename: ((version.files ?? []).find((file) => file.primary) ?? version.files?.[0])?.filename,
+          url: ((version.files ?? []).find((file) => file.primary) ?? version.files?.[0])?.url,
+          dependencies: version.dependencies,
+        })),
+        text: lines.join('\n'),
+      }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  // ---------------------------------------------------------------------------
+  // mc_resolve
+  // ---------------------------------------------------------------------------
+  const resolveTool = defineTool({
+    name: 'mc_resolve',
+    description:
+      '解析一组 Modrinth 项目的完整依赖树（只跟随 required 依赖，可选包含 optional），' +
+      '自动挑选匹配目标 Minecraft 版本 + 加载器的最新稳定版本，输出可安装清单与冲突/缺失警告。' +
+      '项目引用格式：slug、projectId、slug@versionId。',
+    parameters: {
+      type: 'object',
+      properties: {
+        projects: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '项目引用列表，例如 ["sodium","lithium","create@VERSION_ID"]',
+        },
+        gameVersion: { type: 'string', description: '目标 Minecraft 版本，默认插件配置值' },
+        loader: { type: 'string', enum: LOADER_ENUM, description: '目标加载器，默认插件配置值' },
+        includeOptional: { type: 'boolean', description: '是否包含 optional 依赖，默认 false' },
+        maxDepth: { type: 'integer', minimum: 1, maximum: 12, description: '依赖展开最大深度，默认插件配置值' },
+      },
+      required: ['projects'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const gameVersion = args.gameVersion ?? config.defaultGameVersion
+      const loader = args.loader ?? config.defaultLoader
+      const plan = await resolvePlan(
+        config,
+        {
+          refs: args.projects,
+          gameVersion,
+          loader,
+          includeOptional: args.includeOptional ?? false,
+          maxDepth: args.maxDepth ?? Number(config.maxDependencyDepth ?? 6),
+        },
+        exec.signal,
+      )
+      const rows = plan.entries.map((entry) => [
+        truncate(entry.title, 24),
+        entry.slug,
+        truncate(entry.versionNumber ?? entry.versionId ?? '?', 18),
+        entry.versionType ?? '?',
+        sideText(entry),
+        entry.filename ?? '?',
+        entry.direct ? '直接' : `依赖${entry.depth}`,
+      ])
+      const directCount = plan.entries.filter((entry) => entry.direct).length
+      const lines = [
+        `依赖解析完成：${plan.entries.length} 个项目（直接 ${directCount}，依赖 ${plan.entries.length - directCount}） | Minecraft ${gameVersion} / ${loader}`,
+        '',
+        formatTable(['名称', 'slug', '版本', '类型', '客户端/服务端', '文件名', '来源'], rows),
+      ]
+      if (plan.warnings.length) {
+        lines.push('', `警告（${plan.warnings.length}）：`, ...plan.warnings.map((warning) => `- ${warning}`))
+      } else {
+        lines.push('', '没有冲突或缺失警告。')
+      }
+      lines.push('', '下一步：把 projects 列表传给 mc_pack 生成 .mrpack；或直接按清单配置服务端 mods/。')
+      return {
+        tool: 'mc_resolve',
+        gameVersion,
+        loader,
+        entries: plan.entries.map((entry) => ({
+          projectId: entry.projectId,
+          slug: entry.slug,
+          title: entry.title,
+          projectType: entry.projectType,
+          clientSide: entry.clientSide,
+          serverSide: entry.serverSide,
+          versionId: entry.versionId,
+          versionNumber: entry.versionNumber,
+          filename: entry.filename,
+          url: entry.url,
+          sha1: entry.sha1,
+          sha512: entry.sha512,
+          size: entry.size,
+          direct: entry.direct,
+          depth: entry.depth,
+        })),
+        warnings: plan.warnings,
+        text: lines.join('\n'),
+      }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  // ---------------------------------------------------------------------------
+  // mc_pack
+  // ---------------------------------------------------------------------------
+  const packTool = defineTool({
+    name: 'mc_pack',
+    description:
+      '【临时构建】直接按传入的项目列表生成 .mrpack（不读写工程文件）。正式制作流程请用 mc_mods/mc_design 编辑工程，再用 mc_build 构建。' +
+      '把一个项目列表解析成依赖树并生成标准 Modrinth .mrpack 整合包（modrinth.index.json + overrides），' +
+      '可包含 overrides / client-overrides / server-overrides 目录。生成后可直接上传 Modrinth 或分发给客户端。',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: '整合包名称，例如 "永世幻想间"' },
+        projects: { type: 'array', items: { type: 'string' }, description: '项目引用列表（slug 或 slug@versionId）' },
+        output: { type: 'string', description: '输出 .mrpack 路径；相对路径基于工作目录，默认 packs/<name>-<versionId>.mrpack' },
+        versionId: { type: 'string', description: '整合包版本标识，默认使用当天日期' },
+        summary: { type: 'string', description: '整合包简介（可选）' },
+        gameVersion: { type: 'string', description: '目标 Minecraft 版本，默认插件配置值' },
+        loader: { type: 'string', enum: LOADER_ENUM, description: '整合包加载器，默认插件配置值' },
+        loaderVersion: { type: 'string', description: '显式指定加载器版本（NeoForge/Fabric 可自动解析最新版）' },
+        overridesDir: { type: 'string', description: '要打入 overrides/ 的本地目录（config、resourcepacks 等）' },
+        clientOverridesDir: { type: 'string', description: '要打入 client-overrides/ 的本地目录' },
+        serverOverridesDir: { type: 'string', description: '要打入 server-overrides/ 的本地目录' },
+        includeOptional: { type: 'boolean', description: '是否打包 optional 依赖，默认 false' },
+      },
+      required: ['name', 'projects'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const gameVersion = args.gameVersion ?? config.defaultGameVersion
+      const loader = args.loader ?? config.defaultLoader
+      const versionId = args.versionId ?? new Date().toISOString().slice(0, 10)
+      const root = await sessionRoot(exec)
+      const outputPath = outPath(root, args.output, join('packs', `${slugify(args.name)}-${versionId}.mrpack`))
+      const result = await buildMrpack(
+        config,
+        {
+          name: args.name,
+          versionId,
+          summary: args.summary ?? '',
+          projects: args.projects,
+          gameVersion,
+          loader,
+          loaderVersion: args.loaderVersion,
+          outputPath,
+          overridesDir: args.overridesDir ? outPath(root, args.overridesDir) : undefined,
+          clientOverridesDir: args.clientOverridesDir ? outPath(root, args.clientOverridesDir) : undefined,
+          serverOverridesDir: args.serverOverridesDir ? outPath(root, args.serverOverridesDir) : undefined,
+          includeOptional: args.includeOptional ?? false,
+        },
+        exec.signal,
+      )
+      const deps = Object.entries(result.dependencies)
+        .map(([key, value]) => `${key}=${value}`)
+        .join(', ')
+      const lines = [
+        `已生成 .mrpack：${result.outputPath}`,
+        `输出根目录：${root}`,
+        `大小 ${formatBytes(result.size)} | sha1 ${result.sha1} | mod 文件 ${result.files} 个 | overrides 文件 ${result.overrides} 个`,
+        `Minecraft ${result.dependencies.minecraft ?? gameVersion} | ${deps}`,
+        `依赖树项目数：${result.entryCount}`,
+      ]
+      if (result.skipped.length) lines.push('', '未打包（非 mod 资源）：', ...result.skipped.map((item) => `- ${item}`))
+      if (result.warnings.length) lines.push('', '警告：', ...result.warnings.map((item) => `- ${item}`))
+      lines.push('', '可用 mc_pack_check 校验服务端 mods/ 与包的差异。')
+      return { tool: 'mc_pack', ...result, text: lines.join('\n') }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  // ---------------------------------------------------------------------------
+  // mc_loader
+  // ---------------------------------------------------------------------------
+  const loaderTool = defineTool({
+    name: 'mc_loader',
+    description:
+      '查询 Minecraft 版本与各加载器/服务端核心的可用版本：minecraft（Mojang 清单）、neoforge、fabric、paper、velocity、arclight（混合端），含下载直链。',
+    parameters: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: LOADER_KINDS, description: '要查询的类型' },
+        gameVersion: { type: 'string', description: '目标 Minecraft 版本，默认插件配置值（velocity/minecraft 可忽略）' },
+        version: { type: 'string', description: '具体版本（velocity 用来查 builds；paper 可留空）' },
+        variant: { type: 'string', enum: ['neoforge', 'forge', 'fabric'], description: 'arclight 变体，默认跟随插件加载器' },
+        limit: { type: 'integer', minimum: 1, maximum: 50, description: '返回条数，默认 12' },
+      },
+      required: ['kind'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const info = await loaderInfo(
+        config,
+        {
+          kind: args.kind,
+          gameVersion: args.gameVersion ?? config.defaultGameVersion,
+          version: args.version,
+          variant: args.variant,
+          limit: args.limit ?? 12,
+        },
+        exec.signal,
+      )
+      const items = info.items ?? []
+      const isBuildList = args.kind === 'paper' || (args.kind === 'velocity' && Boolean(args.version))
+      const headers = isBuildList ? ['版本/构建', '通道', '日期', '文件', '大小', 'URL'] : ['版本', '类型/通道', '下载直链']
+      const rows = items.map((item) => {
+        if (isBuildList) {
+          return [item.version, item.channel, formatDate(item.date), item.fileName ?? '?', formatBytes(item.size), item.url ?? '?']
+        }
+        return [item.version, item.channel ?? item.type ?? '-', item.url ?? item.serverJarUrl ?? '（见备注）']
+      })
+      const lines = [`${args.kind} 版本信息`]
+      if (info.gameVersion) lines.push(`Minecraft ${info.gameVersion}${info.match ? ` | 匹配 ${info.match}` : ''}${info.total ? ` | 共 ${info.total} 个` : ''}`)
+      if (info.latest) lines.push(`Mojang 最新：release ${info.latest.release} / snapshot ${info.latest.snapshot}`)
+      if (info.installerUrl) lines.push(`安装器：${info.installerUrl}`)
+      lines.push('', formatTable(headers, rows))
+      if (info.notes?.length) lines.push('', ...info.notes.map((note) => `备注：${note}`))
+      return { tool: 'mc_loader', ...info, text: lines.join('\n') }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  // ---------------------------------------------------------------------------
+  // mc_server_config
+  // ---------------------------------------------------------------------------
+  const serverConfigTool = defineTool({
+    name: 'mc_server_config',
+    description:
+      '生成 Minecraft 服务端目录骨架：server.properties、eula、启动脚本，以及 paper/velocity/arclight 的 bukkit/spigot/paper/velocity 配置；' +
+      '支持 neoforge、fabric、paper、velocity、arclight（混合端）。可选下载对应服务端 jar。',
+    parameters: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: SERVER_KINDS, description: '服务端类型' },
+        dir: { type: 'string', description: '输出目录；相对路径基于工作目录' },
+        gameVersion: { type: 'string', description: '目标 Minecraft 版本，默认插件配置值' },
+        loaderVersion: { type: 'string', description: '显式指定加载器版本' },
+        velocityVersion: { type: 'string', description: 'velocity 具体版本（如 3.4.0-SNAPSHOT）' },
+        arclightVariant: { type: 'string', enum: ['neoforge', 'forge', 'fabric'], description: 'arclight 变体' },
+        downloadJar: { type: 'boolean', description: '是否下载服务端 jar（paper/velocity/fabric/arclight/neoforge 安装器），默认 false' },
+        overwrite: { type: 'boolean', description: '是否覆盖已存在的文件，默认 false' },
+        settings: {
+          type: 'object',
+          description:
+            '自定义设置：motd、port、maxPlayers、onlineMode、difficulty、gamemode、pvp、viewDistance、simulationDistance、levelName、levelSeed、whitelist、java.minMemory/java.maxMemory、proxy.enabled/proxy.velocitySecret/proxy.velocityPort/proxy.lobbyAddress',
+        },
+      },
+      required: ['kind', 'dir'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const dir = outPath(await sessionRoot(exec), args.dir)
+      const result = await generateServerConfig(
+        config,
+        {
+          kind: args.kind,
+          dir,
+          gameVersion: args.gameVersion ?? config.defaultGameVersion,
+          loaderVersion: args.loaderVersion,
+          velocityVersion: args.velocityVersion,
+          arclightVariant: args.arclightVariant,
+          downloadJar: args.downloadJar ?? false,
+          overwrite: args.overwrite ?? false,
+          settings: args.settings ?? {},
+        },
+        exec.signal,
+      )
+      const rows = result.files.map((file) => [file.path, file.status])
+      const lines = [
+        `已生成 ${result.kind} 服务端配置：${result.dir}`,
+        '',
+        formatTable(['文件', '状态'], rows),
+      ]
+      if (result.notes.length) lines.push('', '说明：', ...result.notes.map((note) => `- ${note}`))
+      return { tool: 'mc_server_config', ...result, text: lines.join('\n') }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  // ---------------------------------------------------------------------------
+  // mc_status
+  // ---------------------------------------------------------------------------
+  const statusTool = defineTool({
+    name: 'mc_status',
+    description:
+      '通过 Java 版 Server List Ping 协议探测服务器是否在线，返回版本、玩家数、MOTD、延迟与 favicon 是否存在。适用于官网/QQ 群状态展示或运维巡检。',
+    parameters: {
+      type: 'object',
+      properties: {
+        host: { type: 'string', description: '服务器地址，如 "play.ipthmc.cn" 或 "127.0.0.1"' },
+        port: { type: 'integer', minimum: 1, maximum: 65535, description: '端口；省略时先查 _minecraft._tcp SRV 记录，再回退 25565' },
+        timeoutMs: { type: 'integer', minimum: 500, maximum: 20000, description: '超时毫秒，默认 5000' },
+        protocolVersion: { type: 'integer', description: '握手协议号，默认 767（1.21.1）' },
+      },
+      required: ['host'],
+      additionalProperties: false,
+    },
+    async execute(args) {
+      const host = String(args.host ?? '').trim()
+      let srv
+      let port = args.port
+      if (port === undefined) {
+        srv = await resolveMinecraftSrv(host)
+        port = srv?.port ?? 25565
+      }
+      const targetHost = srv?.host ?? host
+      const srvText = srv
+        ? `SRV：${srv.host}:${srv.port}（priority ${srv.priority}, weight ${srv.weight}）`
+        : args.port === undefined
+          ? 'SRV：无记录，直接使用 A 记录 + 25565'
+          : 'SRV：未查询（显式指定了端口）'
+      try {
+        const status = await pingServer({
+          host: targetHost,
+          port,
+          timeoutMs: args.timeoutMs ?? 5000,
+          protocolVersion: args.protocolVersion ?? 767,
+        })
+        const lines = [
+          `${host}${targetHost !== host ? ` → ${targetHost}` : ''}:${port} 在线`,
+          srvText,
+          `版本：${status.versionName}（protocol ${status.protocol ?? '?'}）`,
+          `玩家：${status.playersOnline}/${status.playersMax}`,
+          `MOTD：${status.motd || '（空）'}`,
+          `延迟：${status.latencyMs} ms | favicon：${status.hasFavicon ? '有' : '无'}`,
+        ]
+        return { tool: 'mc_status', online: true, host, port, targetHost, srv, ...status, text: lines.join('\n') }
+      } catch (error) {
+        return {
+          tool: 'mc_status',
+          online: false,
+          host,
+          port,
+          targetHost,
+          srv,
+          error: error.message,
+          text: `${host}${targetHost !== host ? ` → ${targetHost}` : ''}:${port} 离线或不可达：${error.message}\n${srvText}`,
+        }
+      }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  // ---------------------------------------------------------------------------
+  // mc_pack_check
+  // ---------------------------------------------------------------------------
+  const packCheckTool = defineTool({
+    name: 'mc_pack_check',
+    description:
+      '校验服务端目录与 .mrpack 是否一致：按 modrinth.index.json 检查服务端应安装的 mods 是否缺失、sha1 是否匹配，并列出目录里多余的 jar。',
+    parameters: {
+      type: 'object',
+      properties: {
+        pack: { type: 'string', description: '.mrpack 文件路径' },
+        serverDir: { type: 'string', description: '服务端目录（包含 mods/ 或 plugins/）' },
+        checkHashes: { type: 'boolean', description: '是否校验 sha1，默认 true' },
+      },
+      required: ['pack', 'serverDir'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const root = await sessionRoot(exec)
+      const packPath = outPath(root, args.pack)
+      const serverDir = outPath(root, args.serverDir)
+      const { index } = await readMrpack(packPath)
+      const expected = serverFilesOf(index)
+      const missing = []
+      const mismatched = []
+      const checkHashes = args.checkHashes ?? true
+      for (const file of expected) {
+        const absolutePath = join(serverDir, file.path)
+        try {
+          const info = await stat(absolutePath)
+          if (!info.isFile()) throw new Error('not a file')
+          if (checkHashes && file.hashes?.sha1) {
+            const bytes = await readFile(absolutePath)
+            const { createHash } = await import('node:crypto')
+            const actual = createHash('sha1').update(bytes).digest('hex')
+            if (actual !== file.hashes.sha1) mismatched.push({ path: file.path, expected: file.hashes.sha1, actual })
+          }
+        } catch {
+          const disabledPath = `${absolutePath}.disabled`
+          const disabled = await stat(disabledPath).then(() => true).catch(() => false)
+          missing.push({ path: file.path, disabled })
+        }
+      }
+      const expectedPaths = new Set(expected.map((file) => file.path))
+      const extra = []
+      const modsDir = join(serverDir, 'mods')
+      try {
+        const entries = await readdir(modsDir, { withFileTypes: true })
+        for (const entry of entries) {
+          if (!entry.isFile() || !/\.jar(\.disabled)?$/i.test(entry.name)) continue
+          const relative = `mods/${entry.name}`
+          if (!expectedPaths.has(relative) && !expectedPaths.has(`mods/${entry.name.replace(/\.disabled$/i, '')}`)) {
+            extra.push(relative)
+          }
+        }
+      } catch {
+        /* no mods dir */
+      }
+      const lines = [
+        `包：${packPath}`,
+        `Minecraft ${index.dependencies?.minecraft ?? '?'} | ${Object.entries(index.dependencies ?? {})
+          .filter(([key]) => key !== 'minecraft')
+          .map(([key, value]) => `${key} ${value}`)
+          .join(' / ') || '无加载器依赖'}`,
+        `服务端应安装：${expected.length} 个文件 | 缺失 ${missing.length} | 哈希不匹配 ${mismatched.length} | 目录多余 ${extra.length}`,
+      ]
+      if (missing.length) lines.push('', '缺失：', ...missing.map((item) => `- ${item.path}${item.disabled ? '（存在 .disabled，可能已被禁用）' : ''}`))
+      if (mismatched.length) lines.push('', '哈希不匹配：', ...mismatched.map((item) => `- ${item.path}（期望 ${item.expected.slice(0, 12)}…，实际 ${item.actual.slice(0, 12)}…）`))
+      if (extra.length) lines.push('', '目录中多余的 jar（未在包中声明，可能需要移除以保证一致性）：', ...extra.map((item) => `- ${item}`))
+      if (!missing.length && !mismatched.length) lines.push('', '服务端 mods 与整合包完全一致。')
+      return {
+        tool: 'mc_pack_check',
+        pack: packPath,
+        serverDir,
+        expected: expected.length,
+        missing,
+        mismatched,
+        extra,
+        text: lines.join('\n'),
+      }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  // ---------------------------------------------------------------------------
+  // mc_pack_install
+  // ---------------------------------------------------------------------------
+  const packInstallTool = defineTool({
+    name: 'mc_pack_install',
+    description:
+      '把 .mrpack 的服务端内容自动安装到服务器目录：下载 mods/ 文件并校验 sha1，解压 overrides/ 与 server-overrides/（跳过 client-overrides）。' +
+      '用于「整合包 → 服务端」一体化部署；装完可用 mc_pack_check 复核。',
+    parameters: {
+      type: 'object',
+      properties: {
+        pack: { type: 'string', description: '.mrpack 文件路径' },
+        serverDir: { type: 'string', description: '服务端目录（文件会按包内相对路径写入）' },
+        overwrite: { type: 'boolean', description: '是否覆盖已存在且 sha1 不一致的文件，默认 false' },
+        includeOverrides: { type: 'boolean', description: '是否解压 overrides/ 与 server-overrides/，默认 true' },
+        dryRun: { type: 'boolean', description: '只列出将下载/写入的文件，不实际执行，默认 false' },
+      },
+      required: ['pack', 'serverDir'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const root = await sessionRoot(exec)
+      const packPath = outPath(root, args.pack)
+      const serverDir = outPath(root, args.serverDir)
+      const result = await installMrpackToServer(
+        config,
+        {
+          packPath,
+          serverDir,
+          overwrite: args.overwrite ?? false,
+          includeOverrides: args.includeOverrides ?? true,
+          dryRun: args.dryRun ?? false,
+        },
+        exec.signal,
+      )
+      const lines = [
+        `${result.dryRun ? '[dry-run] ' : ''}已把 ${packPath} 安装到 ${serverDir}`,
+        `应安装文件 ${result.expected} 个 | 下载 ${result.downloaded.length} | 已存在跳过 ${result.skipped.length} | 失败 ${result.failed.length} | 写入 ${formatBytes(result.bytes)}`,
+      ]
+      if (result.downloaded.length) {
+        lines.push('', '下载：', ...result.downloaded.map((item) => `- ${item.path}${item.bytes ? `（${formatBytes(item.bytes)}）` : ''}`))
+      }
+      if (result.skipped.length) lines.push('', '跳过（已存在且校验通过）：', ...result.skipped.map((item) => `- ${item.path}`))
+      if (result.failed.length) lines.push('', '失败：', ...result.failed.map((item) => `- ${item.path}：${item.reason}`))
+      if (result.overrides.length) {
+        const writtenOverrides = result.overrides.filter((item) => item.status !== 'skipped')
+        lines.push('', `overrides 写入 ${writtenOverrides.length} 个，跳过 ${result.overrides.length - writtenOverrides.length} 个。`)
+      }
+      return { tool: 'mc_pack_install', ...result, text: lines.join('\n') }
+    },
+    render: (_args, value) => value.text,
+  })
+
+
+  // ---------------------------------------------------------------------------
+  // mc_project — engineering project management (authoring entry point)
+  // ---------------------------------------------------------------------------
+  const projectManageTool = defineTool({
+    name: 'mc_project',
+    description:
+      '整合包工程管理（制作工具入口）：查看工程摘要、初始化设计/覆盖/构建目录、修改包名/版本/目标 MC 版本与加载器/输出目录/设计目录。' +
+      '工程文件（默认 project.json）是唯一事实源；整合包构建产物只是输出，日常创作请改工程文件与 design/ 内容。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['show', 'init', 'update'], description: 'show 查看 / init 初始化 / update 修改' },
+        path: { type: 'string', description: '工程文件路径，默认 project.json' },
+        name: { type: 'string', description: '整合包名称' },
+        versionId: { type: 'string', description: '整合包版本标识' },
+        summary: { type: 'string', description: '整合包简介' },
+        minecraft: { type: 'string', description: '目标 Minecraft 版本' },
+        loader: { type: 'string', enum: LOADER_ENUM, description: '目标加载器' },
+        loaderVersion: { type: 'string', description: '加载器版本（留空自动取最新）' },
+        outputDir: { type: 'string', description: '构建输出目录，默认 builds' },
+        designRoot: { type: 'string', description: '设计内容目录，默认 design' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const { root } = await projectFileFor(exec, args.path)
+      const file = outPath(root, args.path ?? config.projectFile)
+
+      if (args.action === 'init') {
+        let project
+        let created = false
+        try {
+          project = await readProject(file)
+        } catch {
+          project = defaultProject(args.name ?? '未命名整合包')
+          await writeProject(file, project)
+          created = true
+        }
+        const designRoot = resolvePath(root, project.design?.root ?? config.designRoot)
+        const scaffold = await ensureDesignScaffold(designRoot)
+        const overridesDir = resolvePath(root, project.pack.overrides?.overrides ?? 'overrides')
+        const outputDir = resolvePath(root, project.pack.outputDir ?? 'builds')
+        await mkdir(overridesDir, { recursive: true })
+        await mkdir(outputDir, { recursive: true })
+        const lines = [
+          created ? `已创建工程文件：${file}` : `工程文件已存在：${file}（已补齐目录）`,
+          `设计目录：${designRoot}`,
+          `设计类型：${scaffold.kinds.join(', ')}`,
+          `覆盖目录：${overridesDir}`,
+          `构建输出：${outputDir}`,
+          '',
+          '下一步：mc_mods 添加模组 → mc_design 编写剧情/任务 → mc_export 导出 → mc_build 构建。',
+        ]
+        return { tool: 'mc_project', action: 'init', file, created, designRoot, overridesDir, outputDir, text: lines.join('\n') }
+      }
+
+      if (args.action === 'update') {
+        const project = await readProject(file)
+        const before = projectSummary(project)
+        const changes = []
+        if (args.name) {
+          project.name = args.name
+          changes.push(`name → ${args.name}`)
+        }
+        if (args.versionId) {
+          project.pack.versionId = args.versionId
+          changes.push(`versionId → ${args.versionId}`)
+        }
+        if (args.summary !== undefined) {
+          project.pack.summary = args.summary
+          changes.push('summary 已更新')
+        }
+        if (args.minecraft) {
+          project.target.minecraft = args.minecraft
+          changes.push(`minecraft → ${args.minecraft}`)
+        }
+        if (args.loader) {
+          project.target.loader = args.loader
+          changes.push(`loader → ${args.loader}`)
+        }
+        if (args.loaderVersion !== undefined) {
+          project.target.loaderVersion = args.loaderVersion
+          changes.push(`loaderVersion → ${args.loaderVersion || '（自动）'}`)
+        }
+        if (args.outputDir) {
+          project.pack.outputDir = args.outputDir
+          changes.push(`outputDir → ${args.outputDir}`)
+        }
+        if (args.designRoot) {
+          project.design.root = args.designRoot
+          changes.push(`designRoot → ${args.designRoot}`)
+        }
+        if (!changes.length) throw new Error('没有需要修改的字段（name/versionId/summary/minecraft/loader/loaderVersion/outputDir/designRoot）')
+        await writeProject(file, project)
+        const after = projectSummary(project)
+        const lines = [`工程已更新：${file}`, '', ...changes.map((change) => `- ${change}`), '', `目标：Minecraft ${after.target.minecraft} / ${after.target.loader} ${after.target.loaderVersion || '（自动）'}`, `模组：${after.modsCount} 个 | 包版本：${after.versionId}`]
+        return { tool: 'mc_project', action: 'update', file, before, after, changes, text: lines.join('\n') }
+      }
+
+      const project = await readProject(file)
+      const summary = projectSummary(project)
+      const lines = [
+        `工程：${summary.name}（${summary.id}）`,
+        `工程文件：${file}`,
+        `目标：Minecraft ${summary.target.minecraft} / ${summary.target.loader} ${summary.target.loaderVersion || '（自动最新）'}`,
+        `包版本：${summary.versionId} | 模组：${summary.modsCount} 个（锁定 ${summary.pinnedCount}）`,
+        `设计目录：${resolvePath(root, summary.designRoot)}`,
+        `输出目录：${resolvePath(root, summary.outputDir)}`,
+        `覆盖目录：overrides=${summary.overrides?.overrides || '（无）'} / client=${summary.overrides?.clientOverrides || '（无）'} / server=${summary.overrides?.serverOverrides || '（无）'}`,
+      ]
+      if (summary.content?.length) {
+        lines.push('', '内容导出映射：')
+        for (const mapping of summary.content) lines.push(`- ${mapping.from} → ${mapping.zone}/${mapping.to}`)
+      }
+      lines.push('', '命令：mc_mods 编辑模组；mc_design 编辑设计；mc_export 导出游戏格式；mc_build 构建 .mrpack。')
+      return { tool: 'mc_project', action: 'show', file, summary, text: lines.join('\n') }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  // ---------------------------------------------------------------------------
+  // mc_mods — mod list authoring in the project file
+  // ---------------------------------------------------------------------------
+  const modsTool = defineTool({
+    name: 'mc_mods',
+    description:
+      '编辑工程文件里的模组清单（整合包制作核心）：list 列表 / add 添加（自动解析依赖并报告冲突）/ remove 移除 / pin 锁定版本 / unpin 解锁 / resolve 解析依赖树。' +
+      'add/remove/pin/unpin 直接写回工程文件；正式流程先 resolve 检查再 mc_build 构建。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'add', 'remove', 'pin', 'unpin', 'resolve'], description: '操作类型' },
+        refs: { type: 'array', items: { type: 'string' }, description: '模组引用列表：slug、slug@versionId、projectId' },
+        versionId: { type: 'string', description: 'pin 使用的版本 id（也可直接写 refs 里的 slug@versionId）' },
+        path: { type: 'string', description: '工程文件路径，默认 project.json' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const { file } = await projectFileFor(exec, args.path)
+      const project = await readProject(file)
+      const action = args.action
+      const refs = Array.isArray(args.refs) ? args.refs.filter(Boolean) : []
+      if (['add', 'remove', 'pin', 'unpin'].includes(action) && !refs.length) throw new Error(`${action} 需要 refs 参数`)
+      if (action === 'pin' && !args.versionId && !refs.some((ref) => ref.includes('@'))) throw new Error('pin 需要 versionId 参数或 slug@versionId 形式')
+
+      let changed = []
+      if (action === 'add') {
+        changed = addMods(project, refs)
+        if (!changed.length) {
+          return { tool: 'mc_mods', action, file, changed, text: `没有新增模组（都已存在于工程中）\n当前模组：${project.pack.mods.length} 个` }
+        }
+        await writeProject(file, project)
+      } else if (action === 'remove') {
+        changed = removeMods(project, refs)
+        await writeProject(file, project)
+      } else if (action === 'pin') {
+        const mod = pinMod(project, refs[0], args.versionId)
+        changed = [mod]
+        await writeProject(file, project)
+      } else if (action === 'unpin') {
+        changed = unpinMod(project, refs)
+        await writeProject(file, project)
+      }
+
+      if (action === 'list') {
+        const mods = project.pack.mods
+        const rows = mods.map((mod, index) => [index + 1, mod.id, mod.versionId ?? '（跟随最新）', mod.note ?? ''])
+        const lines = [`工程模组清单：${project.name}（${mods.length} 个，锁定 ${mods.filter((mod) => mod.versionId).length}）`, '']
+        lines.push(mods.length ? formatTable(['#', '模组', '锁定版本', '备注'], rows) : '（还没有模组，用 mc_mods action=add 添加）')
+        return { tool: 'mc_mods', action, file, mods, text: lines.join('\n') }
+      }
+
+      let plan
+      let planError
+      try {
+        plan = await resolveProject(config, project, exec.signal)
+      } catch (error) {
+        planError = error.message
+      }
+      const lines = []
+      if (action === 'resolve') {
+        lines.push(`依赖解析：${project.name} | Minecraft ${project.target.minecraft} / ${project.target.loader}`)
+      } else {
+        lines.push(`工程模组已更新：${project.name}（${project.pack.mods.length} 个）`)
+        if (changed.length) lines.push('', '变更：', ...changed.map((mod) => `- ${mod.id ?? mod}${mod.versionId ? `@${mod.versionId}` : ''}`))
+      }
+      if (planError) {
+        lines.push('', `依赖解析失败：${planError}`)
+      } else if (plan) {
+        const directCount = plan.entries.filter((entry) => entry.direct).length
+        lines.push('', `解析到 ${plan.entries.length} 个项目（直接 ${directCount}，依赖 ${plan.entries.length - directCount}）：`)
+        lines.push(
+          formatTable(
+            ['名称', 'slug', '版本', '客户端/服务端', '文件名'],
+            plan.entries.map((entry) => [truncate(entry.title, 22), entry.slug, truncate(entry.versionNumber ?? '?', 18), sideText(entry), entry.filename ?? '?']),
+          ),
+        )
+        if (plan.warnings.length) lines.push('', '警告：', ...plan.warnings.map((warning) => `- ${warning}`))
+        else lines.push('', '没有冲突或缺失警告。')
+      }
+      lines.push('', '下一步：mc_build 从工程构建 .mrpack。')
+      return { tool: 'mc_mods', action, file, changed: changed.map((mod) => mod.id ?? mod), plan: plan ? { total: plan.entries.length, warnings: plan.warnings } : null, text: lines.join('\n') }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  // ---------------------------------------------------------------------------
+  // mc_design — story / quest / character / worldbuilding authoring
+  // ---------------------------------------------------------------------------
+  const designTool = defineTool({
+    name: 'mc_design',
+    description:
+      '编辑整合包设计内容（剧情/任务/人物/势力/地点/世界观/物品/配方）：list 列表 / get 读取 / write 新建或合并 / delete 删除 / check 全量校验（字段 + 交叉引用）/ describe 查看某类字段说明。' +
+      '内容以 design/<kind>/<id>.json 存盘，是创作源文件；改完用 mc_export 导出游戏格式、mc_build 构建。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'get', 'write', 'delete', 'check', 'describe'], description: '操作类型' },
+        kind: { type: 'string', enum: DESIGN_KIND_NAMES, description: '设计类型' },
+        id: { type: 'string', description: '条目 id（文件名，字母/数字/汉字/点/下划线/中划线）' },
+        data: { type: 'object', description: 'write 用的 JSON 对象（顶层字段合并进已有条目）' },
+        replace: { type: 'boolean', description: 'write 时整体替换而非合并，默认 false' },
+        designRoot: { type: 'string', description: '设计目录路径覆盖，默认读工程文件的 design.root' },
+        path: { type: 'string', description: '工程文件路径，默认 project.json' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const { root, file, designRoot: defaultDesignRoot } = await projectPaths(exec, args.path)
+      const designRoot = args.designRoot ? outPath(root, args.designRoot) : defaultDesignRoot
+      const action = args.action
+
+      if (action === 'describe') {
+        if (!args.kind) throw new Error('describe 需要 kind 参数')
+        const meta = DESIGN_KINDS[args.kind]
+        const lines = [
+          `${args.kind}（${meta.label}）→ design/${meta.dir}/<id>.json`,
+          meta.description,
+          '',
+          `必填字段：${meta.required.join(', ')}`,
+          `常用字段：${meta.fields.join(', ')}`,
+          '',
+          '示例：',
+          JSON.stringify(meta.example, null, 2),
+        ]
+        return { tool: 'mc_design', action, kind: args.kind, meta, text: lines.join('\n') }
+      }
+
+      if (action === 'check') {
+        const report = await checkDesign(designRoot)
+        const rows = DESIGN_KIND_NAMES.map((kind) => [kind, DESIGN_KINDS[kind].label, report.stats[kind] ?? 0])
+        const lines = [`设计校验：${designRoot}`, `共 ${report.total} 条设计内容，${report.ok ? '✅ 通过' : '❌ 存在问题'}`, '', formatTable(['kind', '类型', '数量'], rows)]
+        if (report.errors.length) lines.push('', `错误（${report.errors.length}）：`, ...report.errors.map((message) => `- ${message}`))
+        if (report.warnings.length) lines.push('', `警告（${report.warnings.length}）：`, ...report.warnings.map((message) => `- ${message}`))
+        if (report.info.length) lines.push('', '提示：', ...report.info.map((message) => `- ${message}`))
+        if (!report.errors.length && !report.warnings.length) lines.push('', '没有错误或警告。')
+        return { tool: 'mc_design', action, designRoot, ...report, text: lines.join('\n') }
+      }
+
+      if (!args.kind) throw new Error(`${action} 需要 kind 参数`)
+      const meta = DESIGN_KINDS[args.kind]
+
+      if (action === 'list') {
+        const listed = await listEntries(designRoot, args.kind)
+        const rows = listed.entries.map((entry) => {
+          const extra = entry.quests !== undefined ? `任务 ${entry.quests}` : entry.hasBody ? '有正文' : entry.type ?? entry.faction ?? entry.namespace ?? ''
+          return [entry.id, entry.title, entry.order ?? '', extra]
+        })
+        const lines = [`${meta.label}：${listed.entries.length} 条（design/${meta.dir}/）`]
+        if (listed.entries.length) lines.push('', formatTable(['id', '标题', 'order', '备注'], rows))
+        else lines.push('', '（空，用 mc_design action=write 创建）')
+        if (listed.warnings.length) lines.push('', '解析警告：', ...listed.warnings.map((warning) => `- ${warning}`))
+        return { tool: 'mc_design', action, kind: args.kind, designRoot, entries: listed.entries, warnings: listed.warnings, text: lines.join('\n') }
+      }
+
+      if (!args.id) throw new Error(`${action} 需要 id 参数`)
+
+      if (action === 'get') {
+        const entry = await getEntry(designRoot, args.kind, args.id)
+        return { tool: 'mc_design', action, kind: args.kind, id: args.id, path: entry.path, data: entry.data, text: `${meta.label} ${args.kind}/${args.id}：\n\n${JSON.stringify(entry.data, null, 2)}` }
+      }
+
+      if (action === 'delete') {
+        const result = await deleteEntry(designRoot, args.kind, args.id)
+        return {
+          tool: 'mc_design',
+          action,
+          kind: args.kind,
+          id: args.id,
+          path: result.path,
+          deleted: result.deleted,
+          text: result.deleted ? `已删除 ${args.kind}/${args.id}（${result.path}）` : `条目不存在：${args.kind}/${args.id}`,
+        }
+      }
+
+      // write
+      if (!args.data || typeof args.data !== 'object') throw new Error('write 需要 data 对象')
+      const result = await writeEntry(designRoot, args.kind, args.id, args.data, { replace: args.replace ?? false })
+      let relevant = []
+      try {
+        const report = await checkDesign(designRoot)
+        relevant = [...report.errors, ...report.warnings].filter((message) => message.includes(`[${args.kind}/${args.id}]`))
+      } catch {
+        /* validation is best effort */
+      }
+      const validation = result.validation
+      const lines = [
+        result.created ? `已创建 ${meta.label}：${args.kind}/${args.id}` : `已更新 ${meta.label}：${args.kind}/${args.id}`,
+        `文件：${result.path}`,
+      ]
+      if (!validation.ok) lines.push('', '字段错误：', ...validation.errors.map((message) => `- ${message}`))
+      if (validation.warnings.length) lines.push('', '字段警告：', ...validation.warnings.map((message) => `- ${message}`))
+      if (relevant.length) lines.push('', '交叉引用问题：', ...relevant.map((message) => `- ${message}`))
+      if (validation.ok && !relevant.length) lines.push('', '字段与引用校验通过。')
+      lines.push('', '提示：mc_design action=check 可做全量校验；mc_export 导出游戏格式。')
+      return { tool: 'mc_design', action, kind: args.kind, id: args.id, path: result.path, created: result.created, validation, relevant, text: lines.join('\n') }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  // ---------------------------------------------------------------------------
+  // mc_export — design sources -> game files
+  // ---------------------------------------------------------------------------
+  const exportTool = defineTool({
+    name: 'mc_export',
+    description:
+      '把 design/ 设计内容导出成游戏内格式：design-wiki（设计文档 Markdown）、ftbquests（FTB Quests 任务 SNBT）、patchouli（Patchouli 指南书 JSON）、kubejs（KubeJS 物品/配方草稿）。' +
+      '导出会写入 build/exports/<target>/，再由工程文件 pack.content 映射进整合包；导出前建议先 mc_design action=check。',
+    parameters: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', enum: ['all', 'design-wiki', 'ftbquests', 'patchouli', 'kubejs'], description: '导出目标，all 导出全部' },
+        outDir: { type: 'string', description: '导出根目录，默认 build/exports' },
+        namespace: { type: 'string', description: '导出使用的命名空间，默认工程 id' },
+        language: { type: 'string', description: '语言目录（zh_cn/en_us），默认 zh_cn' },
+        designRoot: { type: 'string', description: '设计目录路径覆盖' },
+        path: { type: 'string', description: '工程文件路径，默认 project.json' },
+      },
+      required: ['target'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const { root, file, designRoot: defaultDesignRoot } = await projectPaths(exec, args.path)
+      const designRoot = args.designRoot ? outPath(root, args.designRoot) : defaultDesignRoot
+      let project
+      try {
+        project = await readProject(file)
+      } catch {
+        project = undefined
+      }
+      const exportBase = args.outDir ? outPath(root, args.outDir) : resolvePath(root, 'build/exports')
+      const namespace = args.namespace ?? project?.id ?? config.defaultNamespace
+      const language = args.language ?? 'zh_cn'
+      const targets = args.target === 'all' ? ['design-wiki', 'ftbquests', 'patchouli', 'kubejs'] : [args.target]
+      const results = []
+      const lines = [`设计导出：${designRoot}`, `输出根目录：${exportBase} | namespace=${namespace} | language=${language}`, '']
+      for (const target of targets) {
+        try {
+          let result
+          if (target === 'design-wiki') {
+            result = await exportDesignWiki(designRoot, resolvePath(exportBase, 'design-wiki'))
+          } else if (target === 'ftbquests') {
+            result = await exportFtbQuests({ config, project, designRoot, projectRoot: root, outDir: resolvePath(exportBase, 'ftbquests'), namespace, language, signal: exec.signal })
+          } else if (target === 'patchouli') {
+            result = await exportPatchouli({ config, project, designRoot, projectRoot: root, outDir: resolvePath(exportBase, 'patchouli'), namespace, language, signal: exec.signal })
+          } else if (target === 'kubejs') {
+            result = await exportKubeJs({ config, project, designRoot, projectRoot: root, outDir: resolvePath(exportBase, 'kubejs'), namespace, language, signal: exec.signal })
+          }
+          results.push({ target, ...result })
+          lines.push(`✅ ${target}：${result.summary ?? `${(result.files ?? []).length} 个文件`}`)
+          if (result.outDir) lines.push(`   → ${result.outDir}`)
+          for (const warning of result.warnings ?? []) lines.push(`   ⚠️ ${warning}`)
+        } catch (error) {
+          results.push({ target, error: error.message })
+          lines.push(`❌ ${target}：${error.message}`)
+        }
+      }
+      lines.push('', '导出完成后：确认 project.json 的 pack.content 映射（from→zone/to），再用 mc_build 构建整合包。')
+      return { tool: 'mc_export', target: args.target, namespace, language, results, text: lines.join('\n') }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  // ---------------------------------------------------------------------------
+  // mc_build — build the mrpack from the project file
+  // ---------------------------------------------------------------------------
+  const buildTool = defineTool({
+    name: 'mc_build',
+    description:
+      '从工程文件构建整合包（正式流程）：读取 project.json 的模组清单、目标版本、overrides 目录与 pack.content 导出映射，解析依赖后生成 .mrpack 到 builds/。' +
+      '本工具只负责构建产物；内容创作请改工程文件与 design/，再用 mc_export。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '工程文件路径，默认 project.json' },
+        versionId: { type: 'string', description: '覆盖工程里的包版本标识' },
+        output: { type: 'string', description: '输出 .mrpack 路径；默认 builds/<name>-<versionId>.mrpack' },
+        includeOptional: { type: 'boolean', description: '是否打包 optional 依赖，默认 false' },
+      },
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const { root, file } = await projectFileFor(exec, args.path)
+      const result = await buildFromProject(
+        config,
+        {
+          projectRoot: root,
+          projectPath: file,
+          versionId: args.versionId,
+          outputPath: args.output ? outPath(root, args.output) : undefined,
+          includeOptional: args.includeOptional ?? false,
+        },
+        exec.signal,
+      )
+      const deps = Object.entries(result.dependencies)
+        .map(([key, value]) => `${key}=${value}`)
+        .join(', ')
+      const lines = [
+        `已从工程构建：${result.outputPath}`,
+        `工程：${result.project.name} | Minecraft ${result.dependencies.minecraft} | ${deps}`,
+        `大小 ${formatBytes(result.size)} | sha1 ${result.sha1}`,
+        `mod 文件 ${result.files} 个 | overrides ${result.overrides} 个 | 内容映射文件 ${result.contentFiles ?? 0} 个`,
+      ]
+      if (result.contentMappings?.length) {
+        lines.push('', '内容映射：', ...result.contentMappings.map((mapping) => `- ${mapping.from} → ${mapping.zone}/${mapping.to}（${mapping.files} 文件）`))
+      }
+      if (result.contentWarnings?.length) lines.push('', '内容警告：', ...result.contentWarnings.map((warning) => `- ${warning}`))
+      if (result.skipped?.length) lines.push('', '未打包：', ...result.skipped.map((item) => `- ${item}`))
+      if (result.warnings?.length) lines.push('', '依赖警告：', ...result.warnings.map((warning) => `- ${warning}`))
+      lines.push('', '可用 mc_pack_install / mc_pack_check 同步与校验服务端。')
+      return { tool: 'mc_build', ...result, text: lines.join('\n') }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  const tools = [
+    searchTool,
+    resourceTool,
+    resolveTool,
+    packTool,
+    loaderTool,
+    serverConfigTool,
+    statusTool,
+    packCheckTool,
+    packInstallTool,
+    projectManageTool,
+    modsTool,
+    designTool,
+    exportTool,
+    buildTool,
+  ]
+
+  for (const tool of tools) ctx.tools.register(tool)
+
+  // ---------------------------------------------------------------------------
+  // Web UI: /craft-workshop/api/state feeds the CraftWorkshop settings page.
+  // ---------------------------------------------------------------------------
+  const sendJson = (res, status, value) => {
+    if (res.headersSent) return
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+    res.end(JSON.stringify(value))
+  }
+
+  const resolveUiRoot = async () => {
+    if (config.defaultOutputRoot) return String(config.defaultOutputRoot)
+    if (lastWorkspaceRoot) return lastWorkspaceRoot
+    try {
+      const registry = typeof ctx.get === 'function' ? ctx.get('workspaceRegistry') : undefined
+      const workspaces = registry?.list?.() ?? []
+      for (const workspace of workspaces) {
+        try {
+          await stat(join(workspace.path, config.projectFile))
+          return workspace.path
+        } catch {
+          /* try the next workspace */
+        }
+      }
+      if (workspaces[0]?.path) return workspaces[0].path
+    } catch {
+      /* fall through */
+    }
+    try {
+      const workingDirectory = typeof ctx.get === 'function' ? ctx.get('workingDirectory') : undefined
+      if (workingDirectory?.defaultDirectory) return workingDirectory.defaultDirectory
+    } catch {
+      /* fall through */
+    }
+    return process.cwd()
+  }
+
+  const countFiles = async (dir) => {
+    try {
+      return (await walkFiles(dir)).length
+    } catch {
+      return null
+    }
+  }
+
+  const exportTargets = ['design-wiki', 'ftbquests', 'patchouli', 'kubejs']
+
+  const buildUiState = async () => {
+    const root = await resolveUiRoot()
+    const projectPath = outPath(root, config.projectFile)
+    let project
+    try {
+      project = await readProject(projectPath)
+    } catch {
+      project = undefined
+    }
+    const designRoot = project ? resolvePath(root, project.design?.root ?? config.designRoot) : resolvePath(root, config.designRoot)
+    let design = { total: 0, totals: {}, errors: [], warnings: [], ok: true }
+    try {
+      const report = await checkDesign(designRoot)
+      design = { total: report.total, totals: report.stats, errors: report.errors.slice(0, 8), warnings: report.warnings.slice(0, 8), ok: report.ok }
+    } catch (error) {
+      design = { total: 0, totals: {}, errors: [error.message], warnings: [], ok: false }
+    }
+    const buildsDir = resolvePath(root, project?.pack?.outputDir ?? 'builds')
+    const builds = []
+    try {
+      for (const entry of await readdir(buildsDir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith('.mrpack')) continue
+        const info = await stat(join(buildsDir, entry.name))
+        builds.push({ name: entry.name, size: info.size, modified: info.mtime.toISOString() })
+      }
+      builds.sort((a, b) => b.modified.localeCompare(a.modified))
+    } catch {
+      /* no builds yet */
+    }
+    const exportsInfo = {}
+    for (const target of exportTargets) {
+      const count = await countFiles(resolvePath(root, 'build/exports', target))
+      exportsInfo[target] = count === null ? { present: false, files: 0 } : { present: count > 0, files: count }
+    }
+    let serverMods = null
+    try {
+      serverMods = (await readdir(resolvePath(root, 'server/neoforge/mods'))).filter((name) => name.endsWith('.jar')).length
+    } catch {
+      serverMods = null
+    }
+    const summary = project ? projectSummary(project) : undefined
+    return {
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      workspaceRoot: root,
+      projectFile: projectPath,
+      hasProject: Boolean(project),
+      project: summary ?? null,
+      design,
+      builds: builds.slice(0, 6),
+      buildsTotal: builds.length,
+      exports: exportsInfo,
+      serverMods,
+    }
+  }
+
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['webServer'], (child) => {
+      child.effect(() =>
+        child.webServer.register({
+          kind: 'exact',
+          path: '/craft-workshop/api/state',
+          handler: async (req, res) => {
+            try {
+              sendJson(res, 200, await buildUiState())
+            } catch (error) {
+              sendJson(res, 500, { ok: false, error: error.message })
+            }
+          },
+        }),
+      )
+    })
+  }
+
+}

@@ -1,0 +1,14 @@
+{
+  "id": "item-sample",
+  "name": "示例物品",
+  "namespace": "ipthmc",
+  "lore": [
+    "示例描述"
+  ],
+  "rarity": "rare",
+  "tags": [
+    "武器"
+  ],
+  "recipe": "recipe-sample",
+  "body": "设计说明正文（Markdown）。"
+}

@@ -1,0 +1,96 @@
+{
+  "$schema": "craft-workshop-project/1",
+  "name": "永世幻想间",
+  "id": "ipthmc",
+  "website": "http://IPTHMC.zyghit.cn",
+  "description": "Minecraft 整合包 + 服务器一体式运营项目（Minecraft 1.21.1 / NeoForge / Modrinth .mrpack）",
+  "target": {
+    "minecraft": "1.21.1",
+    "loader": "neoforge",
+    "loaderVersion": "21.1.263"
+  },
+  "pack": {
+    "versionId": "0.1.0-alpha",
+    "summary": "",
+    "mods": [
+      {
+        "id": "create"
+      },
+      {
+        "id": "jei"
+      },
+      {
+        "id": "curios"
+      },
+      {
+        "id": "geckolib"
+      },
+      {
+        "id": "architectury-api"
+      },
+      {
+        "id": "cloth-config"
+      },
+      {
+        "id": "patchouli"
+      }
+    ],
+    "overrides": {
+      "overrides": "overrides",
+      "clientOverrides": "",
+      "serverOverrides": ""
+    },
+    "content": [
+      {
+        "from": "build/exports/ftbquests",
+        "to": "config/ftbquests",
+        "zone": "overrides",
+        "optional": true
+      },
+      {
+        "from": "build/exports/patchouli",
+        "to": "patchouli_books",
+        "zone": "overrides",
+        "optional": true
+      },
+      {
+        "from": "build/exports/kubejs",
+        "to": "kubejs",
+        "zone": "overrides",
+        "optional": true
+      }
+    ],
+    "outputDir": "builds"
+  },
+  "design": {
+    "root": "design"
+  },
+  "servers": {
+    "mod": {
+      "kind": "neoforge",
+      "dir": "server/neoforge",
+      "port": 25565,
+      "motd": "§6永世幻想间 §7| §fIPTHMC",
+      "maxPlayers": 30,
+      "memory": "6G-10G"
+    },
+    "hybrid": {
+      "kind": "arclight",
+      "dir": "server/arclight",
+      "variant": "neoforge",
+      "note": "混合端（模组 + 插件），需按 Arclight README 先准备 NeoForge 运行库"
+    },
+    "proxy": {
+      "kind": "velocity",
+      "dir": "proxy/velocity",
+      "port": 25577,
+      "backend": "127.0.0.1:25565",
+      "forwarding": "modern"
+    }
+  },
+  "operations": {
+    "statusHost": "ipthmc.zyghit.cn",
+    "statusPort": 25565,
+    "statusNote": "2026-10-18 探测：DNS 无 _minecraft._tcp SRV 记录，25565 未响应；需确认实际 MC 地址/端口或配置 SRV。"
+  }
+}

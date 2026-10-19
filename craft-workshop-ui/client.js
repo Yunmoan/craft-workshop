@@ -1,6 +1,10 @@
 /**
- * CraftWorkshop Web UI — manager pages in the DSH settings panel:
- * 概览 / 模组 / 设计内容 / 构建导出 / 服务器.
+ * CraftWorkshop Web UI — a first-class main panel (sidebar icon + 方块工坊 page)
+ * with five sub-pages: 概览 / 模组 / 设计 / 构建 / 服务器.
+ *
+ * Placement: `sidebar.panellist` (id = main panel key) + `main` (key = panel id),
+ * the same global-panel pattern the shipped Plugins/Schedules pages use — not a
+ * settings dialog page.
  *
  * Data and actions come from the Host half's local-only manager API
  * (`/craft-workshop/api/*`). Rendering follows Harness UI rules: React from the
@@ -26,7 +30,13 @@ window.__ModuleLoader__.load({
     }
     const KIND_ORDER = ['character', 'faction', 'location', 'lore', 'story_chapter', 'quest_chapter', 'item', 'recipe']
     const EXPORT_LABELS = { 'design-wiki': '设计文档', ftbquests: 'FTB Quests', patchouli: 'Patchouli 指南书', kubejs: 'KubeJS' }
-
+    const TABS = [
+      ['overview', '概览'],
+      ['mods', '模组'],
+      ['design', '设计'],
+      ['build', '构建'],
+      ['server', '服务器'],
+    ]
     const DESIGN_TEMPLATES = {
       character: { name: '新人物' },
       faction: { name: '新势力' },
@@ -38,9 +48,6 @@ window.__ModuleLoader__.load({
       recipe: { name: '新配方', type: 'shaped', pattern: [], key: {}, output: '', count: 1 },
     }
 
-    // ---------------------------------------------------------------------
-    // Helpers
-    // ---------------------------------------------------------------------
     async function api(path, options) {
       const init = { method: options && options.method ? options.method : 'GET', cache: 'no-store' }
       if (options && options.body !== undefined) {
@@ -88,19 +95,30 @@ window.__ModuleLoader__.load({
       return [state, () => setVersion((value) => value + 1)]
     }
 
-    // ---------------------------------------------------------------------
-    // Shared atoms
-    // ---------------------------------------------------------------------
-    function Logo() {
+    function BlockMark(props) {
+      const size = props.size || 36
       return h(
         'svg',
-        { viewBox: '0 0 64 64', width: 36, height: 36, 'aria-hidden': true, className: 'cw-logo' },
+        { viewBox: '0 0 64 64', width: size, height: size, 'aria-hidden': true, className: 'cw-mark' },
         h('rect', { width: 64, height: 64, rx: 14, fill: '#1d352b' }),
         h('path', { d: 'M32 13 51 22.5 32 32 13 22.5Z', fill: '#4ec56a' }),
         h('path', { d: 'M13 22.5 32 32 32 51 13 41.5Z', fill: '#2f6f3e' }),
         h('path', { d: 'M51 22.5 32 32 32 51 51 41.5Z', fill: '#224d2f' }),
         h('path', { d: 'M38.5 40.5 48.5 50.5', stroke: '#7a4a1f', strokeWidth: 3.4, strokeLinecap: 'round' }),
         h('path', { d: 'M35.5 36.2c3.6-3.8 8.8-5.6 14.2-4.2-3.2-5.6-8.6-8.6-14.6-8.1 1.9 4.1 2 8.2.4 12.3Z', fill: '#e8bf5a' }),
+      )
+    }
+
+    /** Sidebar icon; the owner supplies the square edge and the selected state. */
+    function PanelIcon(props) {
+      const size = (props && props.size) || 20
+      const active = Boolean(props && props.active)
+      return h(
+        'svg',
+        { viewBox: '0 0 24 24', width: size, height: size, 'aria-hidden': true, className: 'cw-navicon' + (active ? ' cw-navicon-on' : '') },
+        h('path', { d: 'M12 2.6 21 7l-9 4.4L3 7l9-4.4Z', fill: 'currentColor', opacity: 0.9 }),
+        h('path', { d: 'M3 7l9 4.4V21.4L3 17V7Z', fill: 'currentColor', opacity: 0.55 }),
+        h('path', { d: 'M21 7l-9 4.4V21.4L21 17V7Z', fill: 'currentColor', opacity: 0.32 }),
       )
     }
 
@@ -111,7 +129,7 @@ window.__ModuleLoader__.load({
     function Card(props) {
       return h(
         'section',
-        { className: 'cw-card' },
+        { className: 'cw-card ' + (props.className || '') },
         props.title
           ? h(
               'div',
@@ -164,34 +182,7 @@ window.__ModuleLoader__.load({
       return h('p', { className: 'cw-note ' + (props.tone ? 'cw-note-' + props.tone : '') }, props.children)
     }
 
-    function PageFrame(props) {
-      return h(
-        'div',
-        { className: 'cw-root' },
-        h('style', null, CSS),
-        h(
-          'header',
-          { className: 'cw-header' },
-          h(Logo),
-          h('div', { className: 'cw-header-text' }, h('h2', { className: 'cw-title' }, props.title), h('p', { className: 'cw-subtitle' }, props.subtitle)),
-          props.refresh ? h(Button, { onClick: props.refresh, busy: props.busy, busyText: '刷新中…' }, '刷新') : null,
-        ),
-        props.children,
-      )
-    }
-
-    function StateView(state, retry) {
-      if (state.phase === 'loading') return h(Note, null, '正在读取工程数据…')
-      if (state.phase === 'error') {
-        return h(Card, { title: '读取失败' }, h(Note, { tone: 'error' }, state.error), h(Button, { onClick: retry }, '重试'))
-      }
-      return null
-    }
-
-    // ---------------------------------------------------------------------
-    // 概览
-    // ---------------------------------------------------------------------
-    function OverviewPage() {
+    function OverviewTab() {
       const [state, refresh] = useProjectState()
       const [busy, setBusy] = React.useState('')
       const [message, setMessage] = React.useState(null)
@@ -217,176 +208,170 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const body = StateView(state, refresh)
+      if (state.phase === 'loading') return h(Note, null, '正在读取工程数据…')
+      if (state.phase === 'error') {
+        return h(Card, { title: '读取失败' }, h(Note, { tone: 'error' }, state.error), h(Button, { onClick: refresh, className: 'cw-mt' }, '重试'))
+      }
+      if (!data.hasProject) {
+        return h(Card, { title: '还没有工程文件' }, h(Note, null, '在会话里让 Agent 运行 mc_project action=init，或确认 DSH 会话工作目录指向项目根目录。'))
+      }
+
       return h(
-        PageFrame,
-        { title: '方块工坊 · 概览', subtitle: '整合包创作面板 · 工程 / 设计内容 / 导出 / 构建', refresh, busy: state.phase === 'refreshing' },
-        body,
-        data && data.hasProject
-          ? h(
-              React.Fragment,
-              null,
+        'div',
+        { className: 'cw-stack' },
+        h(
+          Card,
+          {
+            title: '工程',
+            extra: [h(Badge, { tone: 'brand', key: 'v' }, 'v' + project.versionId), project.website ? h(Badge, { key: 'w' }, project.website) : null],
+          },
+          h('div', { className: 'cw-project-name' }, project.name),
+          h('div', { className: 'cw-project-meta' }, project.id + ' · ' + data.workspaceRoot),
+          h(
+            'div',
+            { className: 'cw-badges' },
+            h(Badge, { tone: 'brand' }, 'Minecraft ' + project.target.minecraft),
+            h(Badge, null, project.target.loader + (project.target.loaderVersion ? ' ' + project.target.loaderVersion : '')),
+          ),
+          project.summary ? h(Note, null, project.summary) : null,
+        ),
+        h(
+          'div',
+          { className: 'cw-stats' },
+          h(Stat, { value: project.modsCount, label: '模组', hint: project.pinnedCount ? project.pinnedCount + ' 个已锁定版本' : '全部跟随最新版' }),
+          h(Stat, { value: design.total, label: '设计内容', hint: design.ok ? '校验通过' : '存在问题', tone: design.ok ? 'success' : 'warn' }),
+          h(Stat, { value: buildsTotal, label: '构建产物', hint: builds[0] ? formatTime(builds[0].modified) : '还没有构建' }),
+          h(Stat, { value: data.serverMods === null ? '—' : data.serverMods, label: '服务端 mods', hint: data.serverDir || 'server/neoforge/mods' }),
+        ),
+        h(
+          Card,
+          { title: '快捷操作', extra: h(Badge, null, '直接写工程 / 产物') },
+          h(
+            'div',
+            { className: 'cw-actions' },
+            h(
+              Button,
+              {
+                primary: true,
+                busy: busy === 'export',
+                onClick: () =>
+                  act('export', async () => {
+                    const result = await api('/export', { method: 'POST', body: { target: 'all' } })
+                    const ok = result.results.filter((item) => item.ok).length
+                    return '导出完成：' + ok + '/' + result.results.length + ' 个目标成功'
+                  }),
+              },
+              '导出全部',
+            ),
+            h(
+              Button,
+              {
+                primary: true,
+                busy: busy === 'build',
+                onClick: () =>
+                  act('build', async () => {
+                    const result = await api('/build', { method: 'POST', body: {} })
+                    return '构建完成：' + result.outputPath + '（' + formatBytes(result.size) + '，' + result.files + ' 个 mod）'
+                  }),
+              },
+              '构建整合包',
+            ),
+          ),
+          message ? h(Note, { tone: message.tone }, message.text) : null,
+        ),
+        h(
+          Card,
+          {
+            title: '设计内容',
+            extra: h(Badge, { tone: design.ok ? 'success' : 'warn' }, design.ok ? '校验通过' : design.errors.length + ' 个错误'),
+          },
+          h(
+            'div',
+            { className: 'cw-chips' },
+            KIND_ORDER.map((kind) => h('span', { key: kind, className: 'cw-chip' }, KIND_LABELS[kind], h('b', null, ' ' + (design.totals[kind] || 0)))),
+          ),
+          design.errors && design.errors.length
+            ? h('ul', { className: 'cw-list cw-error-list' }, design.errors.slice(0, 5).map((text, index) => h('li', { key: index }, text)))
+            : null,
+          design.warnings && design.warnings.length
+            ? h('ul', { className: 'cw-list cw-warn-list' }, design.warnings.slice(0, 4).map((text, index) => h('li', { key: index }, text)))
+            : null,
+        ),
+        h(
+          'div',
+          { className: 'cw-cols' },
+          h(
+            Card,
+            { title: '导出状态' },
+            h(
+              'table',
+              { className: 'cw-table' },
               h(
-                Card,
-                { title: '工程', extra: h(Badge, { tone: 'brand' }, 'v' + project.versionId) },
-                h('div', { className: 'cw-project-name' }, project.name),
-                h('div', { className: 'cw-project-meta' }, project.id + ' · ' + data.workspaceRoot),
-                h(
-                  'div',
-                  { className: 'cw-badges' },
-                  h(Badge, { tone: 'brand' }, 'Minecraft ' + project.target.minecraft),
-                  h(Badge, null, project.target.loader + (project.target.loaderVersion ? ' ' + project.target.loaderVersion : '')),
-                  project.website ? h(Badge, null, project.website) : null,
-                ),
-                project.summary ? h(Note, null, project.summary) : null,
-              ),
-              h(
-                'div',
-                { className: 'cw-stats' },
-                h(Stat, { value: project.modsCount, label: '模组', hint: project.pinnedCount ? project.pinnedCount + ' 个已锁定版本' : '全部跟随最新版' }),
-                h(Stat, { value: design.total, label: '设计内容', hint: design.ok ? '校验通过' : '存在问题', tone: design.ok ? 'success' : 'warn' }),
-                h(Stat, { value: buildsTotal, label: '构建产物', hint: builds[0] ? formatTime(builds[0].modified) : '还没有构建' }),
-                h(Stat, {
-                  value: data.serverMods === null ? '—' : data.serverMods,
-                  label: '服务端 mods',
-                  hint: 'server/neoforge/mods',
+                'tbody',
+                null,
+                Object.keys(EXPORT_LABELS).map((target) => {
+                  const info = exportsInfo[target] || { present: false, files: 0 }
+                  return h(
+                    'tr',
+                    { key: target },
+                    h('td', { className: 'cw-table-label' }, EXPORT_LABELS[target]),
+                    h('td', null, h(Badge, { tone: info.present ? 'success' : 'idle' }, info.present ? info.files + ' 个文件' : '未导出')),
+                  )
                 }),
               ),
-              h(
-                Card,
-                { title: '快捷操作', extra: h(Badge, null, '操作会直接写工程/产物') },
-                h(
-                  'div',
-                  { className: 'cw-actions' },
-                  h(
-                    Button,
-                    {
-                      primary: true,
-                      busy: busy === 'export',
-                      onClick: () =>
-                        act('export', async () => {
-                          const result = await api('/export', { method: 'POST', body: { target: 'all' } })
-                          const ok = result.results.filter((item) => item.ok).length
-                          return '导出完成：' + ok + '/' + result.results.length + ' 个目标成功'
-                        }),
-                    },
-                    '导出全部',
-                  ),
-                  h(
-                    Button,
-                    {
-                      primary: true,
-                      busy: busy === 'build',
-                      onClick: () =>
-                        act('build', async () => {
-                          const result = await api('/build', { method: 'POST', body: {} })
-                          return '构建完成：' + result.outputPath + '（' + formatBytes(result.size) + '，' + result.files + ' 个 mod）'
-                        }),
-                    },
-                    '构建整合包',
-                  ),
-                ),
-                message ? h(Note, { tone: message.tone }, message.text) : null,
-              ),
-              h(
-                Card,
-                {
-                  title: '设计内容',
-                  extra: h(Badge, { tone: design.ok ? 'success' : 'warn' }, design.ok ? '校验通过' : design.errors.length + ' 个错误'),
-                },
-                h(
-                  'div',
-                  { className: 'cw-chips' },
-                  KIND_ORDER.map((kind) =>
-                    h('span', { key: kind, className: 'cw-chip' }, KIND_LABELS[kind], h('b', null, ' ' + (design.totals[kind] || 0))),
-                  ),
-                ),
-                design.errors && design.errors.length
-                  ? h('ul', { className: 'cw-list cw-error-list' }, design.errors.slice(0, 5).map((text, index) => h('li', { key: index }, text)))
-                  : null,
-                design.warnings && design.warnings.length
-                  ? h('ul', { className: 'cw-list cw-warn-list' }, design.warnings.slice(0, 4).map((text, index) => h('li', { key: index }, text)))
-                  : null,
-              ),
-              h(
-                Card,
-                { title: '导出状态' },
-                h(
+            ),
+          ),
+          h(
+            Card,
+            { title: '最近构建' },
+            builds.length
+              ? h(
                   'table',
                   { className: 'cw-table' },
                   h(
                     'tbody',
                     null,
-                    Object.keys(EXPORT_LABELS).map((target) => {
-                      const info = exportsInfo[target] || { present: false, files: 0 }
-                      return h(
+                    builds.slice(0, 4).map((build) =>
+                      h(
                         'tr',
-                        { key: target },
-                        h('td', { className: 'cw-table-label' }, EXPORT_LABELS[target]),
-                        h('td', null, h(Badge, { tone: info.present ? 'success' : 'idle' }, info.present ? info.files + ' 个文件' : '未导出')),
-                        h('td', { className: 'cw-table-hint' }, 'build/exports/' + target),
-                      )
-                    }),
+                        { key: build.name },
+                        h('td', { className: 'cw-table-label' }, build.name),
+                        h('td', null, formatBytes(build.size)),
+                        h('td', { className: 'cw-table-hint' }, formatTime(build.modified)),
+                      ),
+                    ),
+                  ),
+                )
+              : h(Note, null, '还没有 .mrpack；到「构建」页构建。'),
+          ),
+        ),
+        history.length
+          ? h(
+              Card,
+              { title: '操作历史' },
+              h(
+                'table',
+                { className: 'cw-table' },
+                h(
+                  'tbody',
+                  null,
+                  history.slice(0, 8).map((item, index) =>
+                    h(
+                      'tr',
+                      { key: index },
+                      h('td', { className: 'cw-table-label' }, item.action + (item.target ? ' · ' + item.target : '')),
+                      h('td', null, h(Badge, { tone: item.ok ? 'success' : 'warn' }, item.ok ? '成功' : '失败')),
+                      h('td', { className: 'cw-table-hint' }, formatTime(item.time)),
+                    ),
                   ),
                 ),
               ),
-              h(
-                Card,
-                { title: '最近构建' },
-                builds.length
-                  ? h(
-                      'table',
-                      { className: 'cw-table' },
-                      h(
-                        'tbody',
-                        null,
-                        builds.map((build) =>
-                          h(
-                            'tr',
-                            { key: build.name },
-                            h('td', { className: 'cw-table-label' }, build.name),
-                            h('td', null, formatBytes(build.size)),
-                            h('td', { className: 'cw-table-hint' }, formatTime(build.modified)),
-                          ),
-                        ),
-                      ),
-                    )
-                  : h(Note, null, '还没有 .mrpack；点上方「构建整合包」。'),
-              ),
-              history.length
-                ? h(
-                    Card,
-                    { title: '操作历史' },
-                    h(
-                      'table',
-                      { className: 'cw-table' },
-                      h(
-                        'tbody',
-                        null,
-                        history.slice(0, 8).map((item, index) =>
-                          h(
-                            'tr',
-                            { key: index },
-                            h('td', { className: 'cw-table-label' }, item.action + (item.target ? ' · ' + item.target : '')),
-                            h('td', null, h(Badge, { tone: item.ok ? 'success' : 'warn' }, item.ok ? '成功' : '失败')),
-                            h('td', { className: 'cw-table-hint' }, formatTime(item.time)),
-                          ),
-                        ),
-                      ),
-                    ),
-                  )
-                : null,
             )
-          : data
-            ? h(Card, { title: '还没有工程文件' }, h(Note, null, '在会话里让 Agent 运行 mc_project action=init，或确认 DSH 会话工作目录指向项目根目录。'))
-            : null,
+          : null,
       )
     }
 
-    // ---------------------------------------------------------------------
-    // 模组管理器
-    // ---------------------------------------------------------------------
-    function ModsPage() {
+    function ModsTab() {
       const [state, refresh] = useProjectState()
       const [data, setData] = React.useState({ phase: 'loading' })
       const [version, setVersion] = React.useState(0)
@@ -430,6 +415,7 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const direct = plan.filter((entry) => entry.direct)
       const rows =
         data.mods && data.mods.length
           ? data.mods.map((mod) => {
@@ -439,10 +425,11 @@ window.__ModuleLoader__.load({
               return h(
                 'tr',
                 { key: id },
-                h('td', { className: 'cw-table-label' }, id),
+                h('td', { className: 'cw-mono' }, id),
                 h('td', null, entry ? entry.title : '—'),
                 h('td', null, entry ? entry.version : locked || '最新'),
-                h('td', null, entry ? entry.clientSide + '/' + entry.serverSide : '—'),
+                h('td', null, entry ? entry.clientSide + ' / ' + entry.serverSide : '—'),
+                h('td', { className: 'cw-table-hint' }, locked ? '锁定' : ''),
                 h(
                   'td',
                   { className: 'cw-table-actions' },
@@ -464,13 +451,8 @@ window.__ModuleLoader__.load({
           : null
 
       return h(
-        PageFrame,
-        {
-          title: '方块工坊 · 模组管理器',
-          subtitle: '编辑 project.json 的模组清单：添加/移除/锁定，自动解析依赖',
-          refresh,
-          busy: state.phase === 'refreshing',
-        },
+        'div',
+        { className: 'cw-stack' },
         h(
           Card,
           { title: '添加模组', extra: h(Badge, null, project ? project.modsCount + ' 个' : '') },
@@ -496,13 +478,13 @@ window.__ModuleLoader__.load({
               },
               '添加',
             ),
-            h(Button, { onClick: () => setVersion((value) => value + 1), busy: data.phase === 'refreshing' }, '解析依赖'),
+            h(Button, { onClick: () => setVersion((value) => value + 1), busy: data.phase === 'refreshing' }, '重新解析'),
           ),
           message ? h(Note, { tone: message.tone }, message.text) : null,
         ),
         h(
           Card,
-          { title: '模组清单' },
+          { title: '模组清单', extra: h(Badge, null, direct.length ? '解析 ' + direct.length + ' 项' : '') },
           data.phase === 'loading'
             ? h(Note, null, '正在解析依赖（需要联网）…')
             : data.phase === 'error'
@@ -511,7 +493,7 @@ window.__ModuleLoader__.load({
                 ? h(
                     'table',
                     { className: 'cw-table cw-table-wide' },
-                    h('thead', null, h('tr', null, ['模组', '名称', '版本', '客户端/服务端', ''].map((text) => h('th', { key: text }, text)))),
+                    h('thead', null, h('tr', null, ['模组', '名称', '版本', '客户端 / 服务端', '状态', ''].map((text) => h('th', { key: text }, text)))),
                     h('tbody', null, rows),
                   )
                 : h(Note, null, '还没有模组；在上方输入 slug 添加。'),
@@ -522,10 +504,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    // ---------------------------------------------------------------------
-    // 设计内容管理器
-    // ---------------------------------------------------------------------
-    function DesignPage() {
+    function DesignTab() {
       const [state, refresh] = useProjectState()
       const [kind, setKind] = React.useState('character')
       const [list, setList] = React.useState({ phase: 'idle', entries: [] })
@@ -623,26 +602,23 @@ window.__ModuleLoader__.load({
 
       const entries = list.entries || []
       return h(
-        PageFrame,
-        {
-          title: '方块工坊 · 设计管理器',
-          subtitle: '剧情 / 任务 / 人物 / 势力 / 地点 / 世界观 / 物品 / 配方',
-          refresh,
-          busy: state.phase === 'refreshing',
-        },
+        'div',
+        { className: 'cw-stack cw-stack-wide' },
         h(
           'div',
           { className: 'cw-kind-row' },
           KIND_ORDER.map((item) =>
             h('button', { key: item, type: 'button', className: 'cw-kind ' + (item === kind ? 'cw-kind-active' : ''), onClick: () => setKind(item) }, KIND_LABELS[item]),
           ),
+          h('span', { className: 'cw-kind-spacer' }),
+          h(Button, { onClick: runCheck, busy: busy === 'check' }, '全量校验'),
         ),
         h(
           'div',
           { className: 'cw-split' },
           h(
             Card,
-            { title: KIND_LABELS[kind] + '列表', extra: h(Button, { onClick: newEntry }, '新建') },
+            { title: KIND_LABELS[kind] + '（' + entries.length + '）', extra: h(Button, { onClick: newEntry }, '新建') },
             list.phase === 'loading'
               ? h(Note, null, '正在读取…')
               : list.phase === 'error'
@@ -656,7 +632,7 @@ window.__ModuleLoader__.load({
                           'li',
                           { key: entry.id, className: 'cw-entry ' + (entry.id === id ? 'cw-entry-active' : ''), onClick: () => openEntry(entry.id) },
                           h('b', null, entry.title || entry.id),
-                          h('span', null, entry.id),
+                          h('span', null, entry.id + (entry.quests !== undefined ? ' · ' + entry.quests + ' 任务' : '')),
                         ),
                       ),
                     )
@@ -664,7 +640,7 @@ window.__ModuleLoader__.load({
           ),
           h(
             Card,
-            { title: id ? '编辑 ' + kind + '/' + id : '编辑区', extra: h(Button, { onClick: runCheck, busy: busy === 'check' }, '全量校验') },
+            { title: id ? '编辑 ' + kind + '/' + id : '编辑区' },
             h('textarea', {
               className: 'cw-textarea',
               value: text,
@@ -697,10 +673,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    // ---------------------------------------------------------------------
-    // 构建与导出管理器
-    // ---------------------------------------------------------------------
-    function BuildPage() {
+    function BuildTab() {
       const [state, refresh] = useProjectState()
       const [busy, setBusy] = React.useState('')
       const [message, setMessage] = React.useState(null)
@@ -727,16 +700,11 @@ window.__ModuleLoader__.load({
       }
 
       return h(
-        PageFrame,
-        {
-          title: '方块工坊 · 构建与导出',
-          subtitle: 'design/ → 游戏格式 → .mrpack',
-          refresh,
-          busy: state.phase === 'refreshing',
-        },
+        'div',
+        { className: 'cw-stack' },
         h(
           Card,
-          { title: '导出设计内容', extra: h(Badge, null, '写 build/exports/') },
+          { title: '导出设计内容', extra: h(Badge, null, 'design/ → build/exports/') },
           h(
             'div',
             { className: 'cw-actions' },
@@ -835,10 +803,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    // ---------------------------------------------------------------------
-    // 服务器管理器
-    // ---------------------------------------------------------------------
-    function ServerPage() {
+    function ServerTab() {
       const [state, refresh] = useProjectState()
       const [server, setServer] = React.useState({ phase: 'loading' })
       const [backups, setBackups] = React.useState([])
@@ -883,16 +848,10 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const project = state.data && state.data.project
       const check = server.check
       return h(
-        PageFrame,
-        {
-          title: '方块工坊 · 服务器管理器',
-          subtitle: '服务端同步 / 一致性校验 / 状态探测 / 备份',
-          refresh,
-          busy: state.phase === 'refreshing',
-        },
+        'div',
+        { className: 'cw-stack' },
         h(
           'div',
           { className: 'cw-stats' },
@@ -972,77 +931,155 @@ window.__ModuleLoader__.load({
               : null,
         ),
         h(
-          Card,
-          { title: '状态探测' },
+          'div',
+          { className: 'cw-cols' },
           h(
-            'div',
-            { className: 'cw-form-row' },
-            h(Input, { value: host, onChange: setHost, placeholder: '服务器地址，例如 play.example.com' }),
+            Card,
+            { title: '状态探测' },
             h(
-              Button,
-              {
-                busy: busy === 'status',
-                onClick: () =>
-                  act('status', async () => {
-                    const result = await api('/server', { method: 'POST', body: { action: 'status', host } })
-                    setStatus(result.status)
-                    return '在线：' + result.status.versionName + '，玩家 ' + result.status.playersOnline + '/' + result.status.playersMax + '，延迟 ' + result.status.latencyMs + ' ms'
-                  }),
-              },
-              '探测状态',
+              'div',
+              { className: 'cw-form-row' },
+              h(Input, { value: host, onChange: setHost, placeholder: '服务器地址，例如 play.example.com' }),
+              h(
+                Button,
+                {
+                  busy: busy === 'status',
+                  onClick: () =>
+                    act('status', async () => {
+                      const result = await api('/server', { method: 'POST', body: { action: 'status', host } })
+                      setStatus(result.status)
+                      return '在线：' + result.status.versionName + '，玩家 ' + result.status.playersOnline + '/' + result.status.playersMax + '，延迟 ' + result.status.latencyMs + ' ms'
+                    }),
+                },
+                '探测',
+              ),
             ),
+            status
+              ? h(
+                  'div',
+                  { className: 'cw-check' },
+                  h('div', null, '版本：' + status.versionName + '（protocol ' + (status.protocol || '?') + '）'),
+                  h('div', null, '玩家：' + status.playersOnline + '/' + status.playersMax),
+                  h('div', null, 'MOTD：' + status.motd),
+                  h('div', null, '延迟：' + status.latencyMs + ' ms'),
+                )
+              : null,
           ),
-          status
-            ? h(
-                'div',
-                { className: 'cw-check' },
-                h('div', null, '版本：' + status.versionName + '（protocol ' + (status.protocol || '?') + '）'),
-                h('div', null, '玩家：' + status.playersOnline + '/' + status.playersMax),
-                h('div', null, 'MOTD：' + status.motd),
-                h('div', null, '延迟：' + status.latencyMs + ' ms'),
-              )
-            : null,
-        ),
-        h(
-          Card,
-          { title: '备份列表' },
-          backups.length
-            ? h(
-                'table',
-                { className: 'cw-table' },
-                h(
-                  'tbody',
-                  null,
-                  backups.map((backup) =>
-                    h('tr', { key: backup.name }, h('td', { className: 'cw-table-label' }, backup.name), h('td', null, formatBytes(backup.size)), h('td', { className: 'cw-table-hint' }, formatTime(backup.modified))),
+          h(
+            Card,
+            { title: '备份列表' },
+            backups.length
+              ? h(
+                  'table',
+                  { className: 'cw-table' },
+                  h(
+                    'tbody',
+                    null,
+                    backups.slice(0, 6).map((backup) =>
+                      h('tr', { key: backup.name }, h('td', { className: 'cw-table-label' }, backup.name), h('td', null, formatBytes(backup.size)), h('td', { className: 'cw-table-hint' }, formatTime(backup.modified))),
+                    ),
                   ),
-                ),
-              )
-            : h(Note, null, '还没有备份。'),
+                )
+              : h(Note, null, '还没有备份。'),
+          ),
         ),
       )
     }
 
-    // ---------------------------------------------------------------------
-    // Styles
-    // ---------------------------------------------------------------------
+    function WorkshopPanel() {
+      const [tab, setTab] = React.useState('overview')
+      const [state, refresh] = useProjectState()
+      const data = state.data
+      const project = data && data.project
+
+      const content =
+        tab === 'overview'
+          ? h(OverviewTab)
+          : tab === 'mods'
+            ? h(ModsTab)
+            : tab === 'design'
+              ? h(DesignTab)
+              : tab === 'build'
+                ? h(BuildTab)
+                : h(ServerTab)
+
+      return h(
+        'div',
+        { className: 'cw-page' },
+        h('style', null, CSS),
+        h(
+          'header',
+          { className: 'cw-pagehead' },
+          h(BlockMark, { size: 32 }),
+          h(
+            'div',
+            { className: 'cw-brand' },
+            h('h2', { className: 'cw-title' }, '方块工坊'),
+            h(
+              'p',
+              { className: 'cw-sub' },
+              project
+                ? project.name + ' · Minecraft ' + project.target.minecraft + ' / ' + project.target.loader + (project.target.loaderVersion ? ' ' + project.target.loaderVersion : '')
+                : '整合包创作工具',
+            ),
+          ),
+          h(
+            'div',
+            { className: 'cw-headctl' },
+            project ? h(Badge, { tone: 'brand' }, 'v' + project.versionId) : null,
+            h(Button, { onClick: refresh, busy: state.phase === 'refreshing' }, '刷新'),
+          ),
+        ),
+        h(
+          'nav',
+          { className: 'cw-tabs', role: 'tablist' },
+          TABS.map(([key, label]) =>
+            h(
+              'button',
+              {
+                key,
+                type: 'button',
+                role: 'tab',
+                'aria-selected': tab === key,
+                className: 'cw-tab' + (tab === key ? ' cw-tab-on' : ''),
+                onClick: () => setTab(key),
+              },
+              label,
+            ),
+          ),
+        ),
+        h('div', { className: 'cw-body' }, content),
+      )
+    }
+
     const CSS = [
-      '.cw-root{display:flex;flex-direction:column;gap:14px;padding:4px 4px 24px;color:var(--dsw-alias-label-primary);font-family:inherit;max-width:820px}',
-      '.cw-header{display:flex;align-items:center;gap:12px}',
-      '.cw-header-text{flex:1;min-width:0}',
-      '.cw-logo{flex:none;border-radius:10px;overflow:hidden}',
+      '.cw-page{box-sizing:border-box;height:100%;min-height:0;display:flex;flex-direction:column;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-family:inherit;container:cw/inline-size}',
+      '.cw-pagehead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:22px clamp(20px,4vw,44px) 0}',
+      '.cw-brand{min-width:0;flex:1}',
+      '.cw-mark{border-radius:9px;flex:none}',
       '.cw-title{margin:0;font-size:18px;line-height:26px;font-weight:600}',
-      '.cw-subtitle{margin:2px 0 0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}',
+      '.cw-sub{margin:2px 0 0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.cw-headctl{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+      '.cw-tabs{display:flex;gap:2px;flex-wrap:wrap;padding:14px clamp(20px,4vw,44px) 0;border-bottom:1px solid var(--dsw-alias-border-l1)}',
+      '.cw-tab{box-sizing:border-box;border:0;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:13px;padding:6px 12px 9px;cursor:pointer;border-bottom:2px solid transparent;border-radius:6px 6px 0 0}',
+      '.cw-tab:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1)}',
+      '.cw-tab-on{color:var(--dsw-alias-brand-primary);border-bottom-color:var(--dsw-alias-brand-primary);font-weight:500}',
+      '.cw-body{flex:1;min-height:0;overflow-y:auto;scrollbar-gutter:stable;padding:16px clamp(20px,4vw,44px) 48px}',
+      '.cw-stack{display:flex;flex-direction:column;gap:12px;max-width:1000px}',
+      '.cw-stack-wide{max-width:1180px}',
+      '.cw-cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;align-items:start}',
+      '.cw-cols>.cw-card{margin:0}',
       '.cw-button{flex:none;box-sizing:border-box;height:30px;padding:0 12px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;cursor:pointer}',
       '.cw-button:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2)}',
       '.cw-button:disabled{cursor:default;color:var(--dsw-alias-label-secondary);opacity:.7}',
       '.cw-button-primary{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}',
       '.cw-button-danger{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}',
+      '.cw-mt{margin-top:8px}',
       '.cw-card{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);padding:14px 16px}',
       '.cw-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px;flex-wrap:wrap}',
       '.cw-card-title{margin:0;font-size:14px;line-height:22px;font-weight:600}',
-      '.cw-card-extra{display:flex;gap:6px;align-items:center}',
-      '.cw-project-name{font-size:20px;line-height:28px;font-weight:600}',
+      '.cw-card-extra{display:flex;gap:6px;align-items:center;flex-wrap:wrap}',
+      '.cw-project-name{font-size:22px;line-height:30px;font-weight:600}',
       '.cw-project-meta{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);word-break:break-all}',
       '.cw-badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}',
       '.cw-badge{display:inline-flex;align-items:center;box-sizing:border-box;height:22px;padding:0 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);font-size:12px;line-height:20px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2);white-space:nowrap}',
@@ -1050,8 +1087,8 @@ window.__ModuleLoader__.load({
       '.cw-badge-success{border-color:var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary);background:transparent}',
       '.cw-badge-warn{border-color:var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-state-warn-primary);background:transparent}',
       '.cw-badge-idle{color:var(--dsw-alias-state-idle-primary)}',
-      '.cw-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}',
-      '.cw-stat{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);padding:12px 14px}',
+      '.cw-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}',
+      '.cw-stat{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);padding:12px 14px;min-width:0}',
       '.cw-stat-value{font-size:24px;line-height:32px;font-weight:600}',
       '.cw-stat-label{margin-top:2px;font-size:12px;line-height:18px}',
       '.cw-stat-hint{margin-top:2px;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
@@ -1064,21 +1101,24 @@ window.__ModuleLoader__.load({
       '.cw-warn-list{color:var(--dsw-alias-state-warn-primary)}',
       '.cw-table{width:100%;border-collapse:collapse;font-size:12px;line-height:20px}',
       '.cw-table th{text-align:left;font-weight:500;color:var(--dsw-alias-label-secondary);padding:4px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}',
-      '.cw-table td{padding:5px 0;border-bottom:1px solid var(--dsw-alias-border-l1);vertical-align:middle}',
+      '.cw-table td{padding:6px 0;border-bottom:1px solid var(--dsw-alias-border-l1);vertical-align:middle}',
       '.cw-table tr:last-child td{border-bottom:none}',
-      '.cw-table-label{color:var(--dsw-alias-label-primary);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-      '.cw-table-hint{color:var(--dsw-alias-label-secondary);text-align:right}',
+      '.cw-table-label{color:var(--dsw-alias-label-primary);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.cw-table-hint{color:var(--dsw-alias-label-secondary);text-align:right;white-space:nowrap}',
       '.cw-table-actions{text-align:right;white-space:nowrap}',
       '.cw-table-actions .cw-button{height:24px;padding:0 8px;font-size:12px;margin-left:6px}',
+      '.cw-mono{font-family:var(--ds-font-family-code,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:12px}',
       '.cw-actions{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0}',
-      '.cw-form-row{display:flex;gap:8px;align-items:center;margin-top:4px}',
-      '.cw-input{box-sizing:border-box;flex:1;min-width:0;height:30px;padding:0 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px}',
-      '.cw-textarea{box-sizing:border-box;width:100%;min-height:300px;margin-top:2px;padding:10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:18px;resize:vertical}',
-      '.cw-split{display:grid;grid-template-columns:minmax(180px,240px) minmax(0,1fr);gap:12px;align-items:start}',
-      '.cw-kind-row{display:flex;flex-wrap:wrap;gap:6px}',
-      '.cw-kind{box-sizing:border-box;height:26px;padding:0 10px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-family:inherit;font-size:12px;cursor:pointer}',
+      '.cw-form-row{display:flex;gap:8px;align-items:center;margin-top:4px;flex-wrap:wrap}',
+      '.cw-input{box-sizing:border-box;flex:1 1 220px;min-width:0;height:30px;padding:0 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px}',
+      '.cw-textarea{box-sizing:border-box;width:100%;min-height:340px;margin-top:2px;padding:10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-family:var(--ds-font-family-code,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:12px;line-height:18px;resize:vertical}',
+      '.cw-split{display:grid;grid-template-columns:minmax(190px,260px) minmax(0,1fr);gap:12px;align-items:start}',
+      '.cw-kind-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}',
+      '.cw-kind-spacer{flex:1}',
+      '.cw-kind{box-sizing:border-box;height:26px;padding:0 11px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-family:inherit;font-size:12px;cursor:pointer}',
+      '.cw-kind:hover{color:var(--dsw-alias-label-primary)}',
       '.cw-kind-active{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}',
-      '.cw-entry-list{margin:4px 0 0;padding:0;list-style:none;max-height:420px;overflow:auto}',
+      '.cw-entry-list{margin:4px 0 0;padding:0;list-style:none;max-height:440px;overflow:auto}',
       '.cw-entry{display:flex;flex-direction:column;gap:2px;padding:7px 8px;border-radius:8px;cursor:pointer;font-size:12px}',
       '.cw-entry:hover{background:var(--dsw-alias-bg-layer-2)}',
       '.cw-entry-active{background:var(--dsw-alias-bg-layer-2)}',
@@ -1090,35 +1130,35 @@ window.__ModuleLoader__.load({
       '.cw-note-success{color:var(--dsw-alias-state-success-primary)}',
       '.cw-check{margin-top:8px;font-size:12px;line-height:20px;color:var(--dsw-alias-label-secondary)}',
       '.cw-check b{font-weight:500;color:var(--dsw-alias-label-primary)}',
-      '.cw-pre{margin:8px 0 0;padding:10px;border-radius:8px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:17px;white-space:pre-wrap;max-height:180px;overflow:auto}',
+      '.cw-pre{margin:8px 0 0;padding:10px;border-radius:8px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);font-family:var(--ds-font-family-code,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:11px;line-height:17px;white-space:pre-wrap;max-height:200px;overflow:auto}',
+      '.cw-navicon{color:var(--dsw-alias-label-secondary);display:block}',
+      '.cw-navicon-on{color:var(--dsw-alias-brand-primary)}',
+      '@container cw (width<=760px){.cw-split{grid-template-columns:minmax(0,1fr)}.cw-textarea{min-height:240px}}',
     ].join('\n')
 
-    // ---------------------------------------------------------------------
-    // Registration
-    // ---------------------------------------------------------------------
     return {
       inject: ['slots'],
       apply(ctx) {
-        const sections = [
-          ['craft-workshop', 50, '方块工坊 · 概览', OverviewPage],
-          ['craft-workshop-mods', 51, '方块工坊 · 模组', ModsPage],
-          ['craft-workshop-design', 52, '方块工坊 · 设计', DesignPage],
-          ['craft-workshop-build', 53, '方块工坊 · 构建', BuildPage],
-          ['craft-workshop-server', 54, '方块工坊 · 服务器', ServerPage],
-        ]
-        for (const [id, order, label, Component] of sections) {
-          ctx.slots.inject('settings.section', () =>
-            ctx.slots.register(
-              {
-                name: 'settings.section',
-                id,
-                order,
-                label: () => label,
-              },
-              Component,
-            ),
-          )
-        }
+        ctx.slots.inject('sidebar.panellist', () =>
+          ctx.slots.register(
+            {
+              name: 'sidebar.panellist',
+              id: 'craft-workshop',
+              order: 25,
+              label: () => '方块工坊',
+            },
+            PanelIcon,
+          ),
+        )
+        ctx.slots.inject('main', () =>
+          ctx.slots.register(
+            {
+              name: 'main',
+              key: 'craft-workshop',
+            },
+            WorkshopPanel,
+          ),
+        )
       },
     }
   },

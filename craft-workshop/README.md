@@ -125,7 +125,7 @@ Host 半在 `webServer` 上注册了一套**仅限本机**的管理器接口（P
 | `projectFile` | `project.json` | 工程文件路径 |
 | `designRoot` | `design` | 设计目录 |
 | `defaultNamespace` | `ipthmc` | 导出命名空间/物品命名空间 |
-| `userAgent` | `craft-workshop/0.4.0 (...)` | API 请求 UA |
+| `userAgent` | `craft-workshop/0.5.0 (...)` | API 请求 UA |
 | `defaultOutputRoot` | 空 | 相对路径基准；空 = 当前会话目录 |
 | `cacheTtlSeconds` / `requestTimeoutMs` / `maxDependencyDepth` | 600 / 20000 / 6 | 查询与解析参数 |
 | `curseForgeApiKey` | 空 | 预留 |

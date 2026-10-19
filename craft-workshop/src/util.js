@@ -18,7 +18,7 @@ function describeFetchError(error, url) {
 }
 
 /** Default UA used when the plugin config does not provide one (Modrinth requires a UA). */
-export const DEFAULT_USER_AGENT = 'craft-workshop/0.4.0 (https://ipthmc.zyghit.cn)'
+export const DEFAULT_USER_AGENT = 'craft-workshop/0.5.0 (https://ipthmc.zyghit.cn)'
 
 export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))

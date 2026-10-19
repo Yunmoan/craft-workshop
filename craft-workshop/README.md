@@ -43,6 +43,27 @@ IPTHMC 社团的 **Minecraft 整合包创作工具**（DSH Host 插件）。它�
 | `mc_pack_check` | 服务端目录 vs 整合包一致性校验 |
 | `mc_status` | Java SLP 服务器探活（MOTD 组件展开 + `_minecraft._tcp` SRV） |
 
+## 管理器 API（Web UI 用）
+
+Host 半在 `webServer` 上注册了一套**仅限本机**的管理器接口（POST 会校验来源地址必须是本机），供 Web UI 使用；Agent 也可以直接调试：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/craft-workshop/api/state` | 工程摘要 + 8 类设计统计 + 校验问题 + 导出状态 + 最近构建 + 操作历史 |
+| GET | `/craft-workshop/api/history` | 最近 60 条操作历史 |
+| GET | `/craft-workshop/api/mods?resolve=1` | 模组清单，可选解析出最新版本与依赖树 |
+| POST | `/craft-workshop/api/mods` | `{ action: add/remove/pin/unpin, refs, versionId }` |
+| GET | `/craft-workshop/api/design?kind=&id=` | 设计列表 / 单条内容 |
+| POST | `/craft-workshop/api/design` | `{ action: write/delete/check, kind, id, data }` |
+| POST | `/craft-workshop/api/export` | `{ target: design-wiki/ftbquests/patchouli/kubejs/all }` |
+| POST | `/craft-workshop/api/build` | 从工程构建 `.mrpack` |
+| GET | `/craft-workshop/api/builds` | 构建产物列表 |
+| GET | `/craft-workshop/api/server` | 服务端目录、mods 数、最新构建、一致性检查 |
+| POST | `/craft-workshop/api/server` | `{ action: status/install/check/backup/generate }` |
+| GET | `/craft-workshop/api/backups` | 服务端备份列表（`build/backups/`） |
+
+管理器内部拆成 ProjectManager / ModManager / DesignManager / ExportManager / BuildManager / ServerManager 六块，工具（`mc_*`）与 Web UI 走同一套实现，避免两边逻辑漂移。操作历史写在 `.craft-workshop/history.json`（已 gitignore）。
+
 ## 工程文件（默认 `project.json`）
 
 ```jsonc
@@ -104,7 +125,7 @@ IPTHMC 社团的 **Minecraft 整合包创作工具**（DSH Host 插件）。它�
 | `projectFile` | `project.json` | 工程文件路径 |
 | `designRoot` | `design` | 设计目录 |
 | `defaultNamespace` | `ipthmc` | 导出命名空间/物品命名空间 |
-| `userAgent` | `craft-workshop/0.3.0 (...)` | API 请求 UA |
+| `userAgent` | `craft-workshop/0.4.0 (...)` | API 请求 UA |
 | `defaultOutputRoot` | 空 | 相对路径基准；空 = 当前会话目录 |
 | `cacheTtlSeconds` / `requestTimeoutMs` / `maxDependencyDepth` | 600 / 20000 / 6 | 查询与解析参数 |
 | `curseForgeApiKey` | 空 | 预留 |

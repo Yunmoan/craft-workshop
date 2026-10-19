@@ -90,7 +90,21 @@ mc_build                                # 从工程构建 .mrpack
 - 物品注册在启动时执行一次：**新增/修改物品后必须重启游戏**；配方可用 `/reload`。
 - 核心机制脚本仍建议手写在 `overrides/kubejs/`。
 
-## 5. 设计文档导出
+## 5. DSH 管理器（设置 → 方块工坊）
+
+管理与创作有两种等价入口，底层是同一套管理器：
+
+| 页面 | 能做什么 |
+|---|---|
+| 概览 | 看工程/统计/导出状态/构建与操作历史；一键导出全部、构建整合包 |
+| 模组 | 加/删/解锁模组，查看解析后的版本与双端支持 |
+| 设计 | 按 8 类设计浏览、直接编辑 JSON、新建、删除、全量校验 |
+| 构建 | 逐项或一次导出四种格式，构建 `.mrpack`，查看构建列表与操作日志 |
+| 服务器 | 检查服务端一致性、同步安装、备份、生成服务端配置、探测在线状态 |
+
+Agent 侧的 `mc_project` / `mc_mods` / `mc_design` / `mc_export` / `mc_build` / `mc_pack_install` / `mc_pack_check` / `mc_server_config` / `mc_status` 与页面对应；两边都改同一份工程与设计源文件。操作历史记录在 `.craft-workshop/history.json`。
+
+## 6. 设计文档导出
 
 `mc_export target=design-wiki` 会把设计内容渲染成 Markdown（`build/exports/design-wiki/`），适合：
 
@@ -98,14 +112,14 @@ mc_build                                # 从工程构建 .mrpack
 - 提交到仓库做版本 diff；
 - 作为剧情与任务的"审稿稿"。
 
-## 6. 与服务器部署的衔接
+## 7. 与服务器部署的衔接
 
 1. `mc_build` 生成 `.mrpack`；
 2. `mc_pack_install pack=... serverDir=server/neoforge` 同步服务端 mods 并校验 sha1；
 3. `mc_pack_check` 复核一致性；
 4. `mc_server_config` 维护服务端配置（NeoForge/Paper/Velocity/Arclight 模板）。
 
-## 7. 约定与注意事项
+## 8. 约定与注意事项
 
 - `design/<kind>/<id>.json` 的 `id` 只允许字母/数字/汉字/点/下划线/中划线，且必须等于文件名。
 - 设计 id 用于稳定派生 FTB Quests 的 16hex ID：**改 id 会导致任务进度不兼容**（发布后不要随意改）。

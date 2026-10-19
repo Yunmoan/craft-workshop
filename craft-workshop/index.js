@@ -9,7 +9,7 @@
  *  - Java server status ping (Server List Ping)
  *  - modpack ↔ server mod directory consistency checks
  */
-import { mkdir, readFile, readdir, stat } from 'node:fs/promises'
+import { mkdir, stat } from 'node:fs/promises'
 import { isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { formatBytes, formatDate, formatTable, truncate } from './src/util.js'
 import {
@@ -21,7 +21,8 @@ import {
   searchProjects,
 } from './src/modrinth.js'
 import { LOADER_KINDS, loaderInfo } from './src/loaders.js'
-import { buildMrpack, installMrpackToServer, readMrpack, serverFilesOf, walkFiles } from './src/mrpack.js'
+import { buildMrpack, installMrpackToServer } from './src/mrpack.js'
+import { checkPackAgainstServer } from './src/packcheck.js'
 import { SERVER_KINDS, generateServerConfig } from './src/servercfg.js'
 import { pingServer, resolveMinecraftSrv } from './src/ping.js'
 import {
@@ -36,6 +37,7 @@ import {
   writeEntry,
 } from './src/design.js'
 import { exportFtbQuests, exportKubeJs, exportPatchouli } from './src/exporters.js'
+import { registerWebUi } from './src/webui.js'
 import {
   addMods,
   buildFromProject,
@@ -52,7 +54,7 @@ import {
 export const inject = ['tools']
 
 const DEFAULTS = {
-  userAgent: 'craft-workshop/0.3.0 (https://ipthmc.zyghit.cn)',
+  userAgent: 'craft-workshop/0.4.0 (https://ipthmc.zyghit.cn)',
   defaultGameVersion: '1.21.1',
   defaultLoader: 'neoforge',
   defaultOutputRoot: '',
@@ -586,14 +588,29 @@ export function apply(ctx, rawConfig) {
       additionalProperties: false,
     },
     async execute(args, exec) {
-      const dir = outPath(await sessionRoot(exec), args.dir)
+      const root = await sessionRoot(exec)
+      const dir = outPath(root, args.dir)
+      const gameVersion = args.gameVersion ?? config.defaultGameVersion
+      // Offline-friendly: reuse the version pinned in the project file for this loader
+      // before reaching out to the loader's metadata service.
+      let loaderVersion = args.loaderVersion
+      if (!loaderVersion && (args.kind === 'neoforge' || args.kind === 'fabric')) {
+        try {
+          const project = await readProject(outPath(root, config.projectFile))
+          if (project.target.loader === args.kind && project.target.minecraft === gameVersion && project.target.loaderVersion) {
+            loaderVersion = project.target.loaderVersion
+          }
+        } catch {
+          /* no project file yet */
+        }
+      }
       const result = await generateServerConfig(
         config,
         {
           kind: args.kind,
           dir,
-          gameVersion: args.gameVersion ?? config.defaultGameVersion,
-          loaderVersion: args.loaderVersion,
+          gameVersion,
+          loaderVersion,
           velocityVersion: args.velocityVersion,
           arclightVariant: args.arclightVariant,
           downloadJar: args.downloadJar ?? false,
@@ -699,65 +716,23 @@ export function apply(ctx, rawConfig) {
       const root = await sessionRoot(exec)
       const packPath = outPath(root, args.pack)
       const serverDir = outPath(root, args.serverDir)
-      const { index } = await readMrpack(packPath)
-      const expected = serverFilesOf(index)
-      const missing = []
-      const mismatched = []
-      const checkHashes = args.checkHashes ?? true
-      for (const file of expected) {
-        const absolutePath = join(serverDir, file.path)
-        try {
-          const info = await stat(absolutePath)
-          if (!info.isFile()) throw new Error('not a file')
-          if (checkHashes && file.hashes?.sha1) {
-            const bytes = await readFile(absolutePath)
-            const { createHash } = await import('node:crypto')
-            const actual = createHash('sha1').update(bytes).digest('hex')
-            if (actual !== file.hashes.sha1) mismatched.push({ path: file.path, expected: file.hashes.sha1, actual })
-          }
-        } catch {
-          const disabledPath = `${absolutePath}.disabled`
-          const disabled = await stat(disabledPath).then(() => true).catch(() => false)
-          missing.push({ path: file.path, disabled })
-        }
-      }
-      const expectedPaths = new Set(expected.map((file) => file.path))
-      const extra = []
-      const modsDir = join(serverDir, 'mods')
-      try {
-        const entries = await readdir(modsDir, { withFileTypes: true })
-        for (const entry of entries) {
-          if (!entry.isFile() || !/\.jar(\.disabled)?$/i.test(entry.name)) continue
-          const relative = `mods/${entry.name}`
-          if (!expectedPaths.has(relative) && !expectedPaths.has(`mods/${entry.name.replace(/\.disabled$/i, '')}`)) {
-            extra.push(relative)
-          }
-        }
-      } catch {
-        /* no mods dir */
-      }
+      const result = await checkPackAgainstServer(packPath, serverDir, { checkHashes: args.checkHashes ?? true })
+      const dependencies = Object.entries(result.dependencies ?? {})
+        .filter(([key]) => key !== 'minecraft')
+        .map(([key, value]) => `${key} ${value}`)
+        .join(' / ')
       const lines = [
         `包：${packPath}`,
-        `Minecraft ${index.dependencies?.minecraft ?? '?'} | ${Object.entries(index.dependencies ?? {})
-          .filter(([key]) => key !== 'minecraft')
-          .map(([key, value]) => `${key} ${value}`)
-          .join(' / ') || '无加载器依赖'}`,
-        `服务端应安装：${expected.length} 个文件 | 缺失 ${missing.length} | 哈希不匹配 ${mismatched.length} | 目录多余 ${extra.length}`,
+        `Minecraft ${result.dependencies?.minecraft ?? '?'} | ${dependencies || '无加载器依赖'}`,
+        `服务端应安装：${result.expected} 个文件 | 缺失 ${result.missing.length} | 哈希不匹配 ${result.mismatched.length} | 目录多余 ${result.extra.length}`,
       ]
-      if (missing.length) lines.push('', '缺失：', ...missing.map((item) => `- ${item.path}${item.disabled ? '（存在 .disabled，可能已被禁用）' : ''}`))
-      if (mismatched.length) lines.push('', '哈希不匹配：', ...mismatched.map((item) => `- ${item.path}（期望 ${item.expected.slice(0, 12)}…，实际 ${item.actual.slice(0, 12)}…）`))
-      if (extra.length) lines.push('', '目录中多余的 jar（未在包中声明，可能需要移除以保证一致性）：', ...extra.map((item) => `- ${item}`))
-      if (!missing.length && !mismatched.length) lines.push('', '服务端 mods 与整合包完全一致。')
-      return {
-        tool: 'mc_pack_check',
-        pack: packPath,
-        serverDir,
-        expected: expected.length,
-        missing,
-        mismatched,
-        extra,
-        text: lines.join('\n'),
+      if (result.missing.length) lines.push('', '缺失：', ...result.missing.map((item) => `- ${item.path}${item.disabled ? '（存在 .disabled，可能已被禁用）' : ''}`))
+      if (result.mismatched.length) {
+        lines.push('', '哈希不匹配：', ...result.mismatched.map((item) => `- ${item.path}（期望 ${String(item.expected).slice(0, 12)}…，实际 ${item.actual.slice(0, 12)}…）`))
       }
+      if (result.extra.length) lines.push('', '目录中多余的 jar（未在包中声明，可能需要移除以保证一致性）：', ...result.extra.map((item) => `- ${item}`))
+      if (result.ok) lines.push('', '服务端 mods 与整合包完全一致。')
+      return { tool: 'mc_pack_check', pack: packPath, serverDir, ...result, text: lines.join('\n') }
     },
     render: (_args, value) => value.text,
   })
@@ -1275,14 +1250,8 @@ export function apply(ctx, rawConfig) {
   for (const tool of tools) ctx.tools.register(tool)
 
   // ---------------------------------------------------------------------------
-  // Web UI: /craft-workshop/api/state feeds the CraftWorkshop settings page.
+  // Web UI manager API (local-only): powers the CraftWorkshop settings pages.
   // ---------------------------------------------------------------------------
-  const sendJson = (res, status, value) => {
-    if (res.headersSent) return
-    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
-    res.end(JSON.stringify(value))
-  }
-
   const resolveUiRoot = async () => {
     if (config.defaultOutputRoot) return String(config.defaultOutputRoot)
     if (lastWorkspaceRoot) return lastWorkspaceRoot
@@ -1310,88 +1279,6 @@ export function apply(ctx, rawConfig) {
     return process.cwd()
   }
 
-  const countFiles = async (dir) => {
-    try {
-      return (await walkFiles(dir)).length
-    } catch {
-      return null
-    }
-  }
-
-  const exportTargets = ['design-wiki', 'ftbquests', 'patchouli', 'kubejs']
-
-  const buildUiState = async () => {
-    const root = await resolveUiRoot()
-    const projectPath = outPath(root, config.projectFile)
-    let project
-    try {
-      project = await readProject(projectPath)
-    } catch {
-      project = undefined
-    }
-    const designRoot = project ? resolvePath(root, project.design?.root ?? config.designRoot) : resolvePath(root, config.designRoot)
-    let design = { total: 0, totals: {}, errors: [], warnings: [], ok: true }
-    try {
-      const report = await checkDesign(designRoot)
-      design = { total: report.total, totals: report.stats, errors: report.errors.slice(0, 8), warnings: report.warnings.slice(0, 8), ok: report.ok }
-    } catch (error) {
-      design = { total: 0, totals: {}, errors: [error.message], warnings: [], ok: false }
-    }
-    const buildsDir = resolvePath(root, project?.pack?.outputDir ?? 'builds')
-    const builds = []
-    try {
-      for (const entry of await readdir(buildsDir, { withFileTypes: true })) {
-        if (!entry.isFile() || !entry.name.endsWith('.mrpack')) continue
-        const info = await stat(join(buildsDir, entry.name))
-        builds.push({ name: entry.name, size: info.size, modified: info.mtime.toISOString() })
-      }
-      builds.sort((a, b) => b.modified.localeCompare(a.modified))
-    } catch {
-      /* no builds yet */
-    }
-    const exportsInfo = {}
-    for (const target of exportTargets) {
-      const count = await countFiles(resolvePath(root, 'build/exports', target))
-      exportsInfo[target] = count === null ? { present: false, files: 0 } : { present: count > 0, files: count }
-    }
-    let serverMods = null
-    try {
-      serverMods = (await readdir(resolvePath(root, 'server/neoforge/mods'))).filter((name) => name.endsWith('.jar')).length
-    } catch {
-      serverMods = null
-    }
-    const summary = project ? projectSummary(project) : undefined
-    return {
-      ok: true,
-      generatedAt: new Date().toISOString(),
-      workspaceRoot: root,
-      projectFile: projectPath,
-      hasProject: Boolean(project),
-      project: summary ?? null,
-      design,
-      builds: builds.slice(0, 6),
-      buildsTotal: builds.length,
-      exports: exportsInfo,
-      serverMods,
-    }
-  }
-
-  if (typeof ctx.inject === 'function') {
-    ctx.inject(['webServer'], (child) => {
-      child.effect(() =>
-        child.webServer.register({
-          kind: 'exact',
-          path: '/craft-workshop/api/state',
-          handler: async (req, res) => {
-            try {
-              sendJson(res, 200, await buildUiState())
-            } catch (error) {
-              sendJson(res, 500, { ok: false, error: error.message })
-            }
-          },
-        }),
-      )
-    })
-  }
+  registerWebUi(ctx, config, { getRoot: resolveUiRoot, outPath })
 
 }

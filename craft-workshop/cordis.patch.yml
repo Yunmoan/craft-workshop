@@ -4,7 +4,7 @@
     - id: craft-workshop
       name: '@ipthmc/craft-workshop'
       config:
-        userAgent: 'craft-workshop/0.3.0 (https://ipthmc.zyghit.cn)'
+        userAgent: 'craft-workshop/0.4.0 (https://ipthmc.zyghit.cn)'
         defaultGameVersion: '1.21.1'
         defaultLoader: neoforge
         defaultOutputRoot: ''

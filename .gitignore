@@ -7,6 +7,7 @@ node_modules/
 build/
 builds/
 build/exports/
+.craft-workshop/
 
 # 服务端/代理运行目录（含 eula、forwarding.secret 等本机凭据）
 server/

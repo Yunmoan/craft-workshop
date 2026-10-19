@@ -13,7 +13,7 @@ import { pingServer } from '../src/ping.js'
 import { createZip, readZip } from '../src/zip.js'
 
 const config = {
-  userAgent: 'craft-workshop-smoke/0.3.0 (https://ipthmc.zyghit.cn)',
+  userAgent: 'craft-workshop-smoke/0.4.0 (https://ipthmc.zyghit.cn)',
   defaultGameVersion: '1.21.1',
   defaultLoader: 'neoforge',
   cacheTtlSeconds: 0,

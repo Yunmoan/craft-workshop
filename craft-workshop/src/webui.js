@@ -1,0 +1,586 @@
+/**
+ * Web UI backend for CraftWorkshop: a local-only HTTP API over the project managers.
+ *
+ * Routes (all under /craft-workshop/api):
+ *   GET  /state                     project dashboard snapshot
+ *   GET  /design?kind=&id=          design list or one entry
+ *   POST /design                    { action: 'write'|'delete'|'check' }
+ *   POST /export                    { target }
+ *   POST /build                     { versionId?, includeOptional? }
+ *   GET  /mods?resolve=1            project mod list, optionally resolved
+ *   POST /mods                      { action: 'add'|'remove'|'pin'|'unpin', refs, versionId }
+ *   GET  /server                    server directory state
+ *   POST /server                    { action: 'status'|'install'|'check'|'backup'|'generate', ... }
+ *   GET  /backups                   server backup list
+ *   GET  /history                   recent operation history
+ */
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import { join, resolve as resolvePath } from 'node:path'
+import {
+  DESIGN_KINDS,
+  checkDesign,
+  deleteEntry,
+  exportDesignWiki,
+  getEntry,
+  listEntries,
+  writeEntry,
+} from './design.js'
+import { exportFtbQuests, exportKubeJs, exportPatchouli } from './exporters.js'
+import { checkPackAgainstServer } from './packcheck.js'
+import {
+  addMods,
+  buildFromProject,
+  pinMod,
+  projectSummary,
+  readProject,
+  removeMods,
+  resolveProject,
+  unpinMod,
+  writeProject,
+} from './project.js'
+import { installMrpackToServer, walkFiles } from './mrpack.js'
+import { pingServer, resolveMinecraftSrv } from './ping.js'
+import { generateServerConfig } from './servercfg.js'
+import { createZip } from './zip.js'
+
+const EXPORT_TARGETS = ['design-wiki', 'ftbquests', 'patchouli', 'kubejs']
+const HISTORY_FILE = '.craft-workshop/history.json'
+const MAX_HISTORY = 60
+
+function isLoopback(address) {
+  const text = String(address ?? '')
+  return text === '127.0.0.1' || text === '::1' || text === '::ffff:127.0.0.1' || text === 'localhost' || text === ''
+}
+
+async function readJsonBody(req, limit = 2 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0
+    const chunks = []
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > limit) {
+        reject(new Error('请求体过大'))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      if (!chunks.length) return resolve({})
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+      } catch (error) {
+        reject(new Error(`JSON 解析失败：${error.message}`))
+      }
+    })
+    req.on('error', reject)
+  })
+}
+
+function sendJson(res, status, value) {
+  if (res.headersSent) return
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+  res.end(JSON.stringify(value))
+}
+
+/**
+ * Wire the manager API into the Harness web server.
+ * @param {object} ctx plugin context
+ * @param {object} config plugin config
+ * @param {{ getRoot: () => Promise<string>, outPath: (root: string, value?: string, fallback?: string) => string }} helpers
+ */
+export function registerWebUi(ctx, config, helpers) {
+  const { getRoot, outPath } = helpers
+
+  const rootNow = async () => {
+    const root = await getRoot()
+    return root
+  }
+  const projectPathNow = async () => outPath(await rootNow(), config.projectFile)
+  const designRootNow = async (project) => resolvePath(await rootNow(), project?.design?.root ?? config.designRoot)
+  const serverDirNow = async (project) => outPath(await rootNow(), project?.servers?.mod?.dir ?? 'server/neoforge')
+  const buildsDirNow = async (project) => outPath(await rootNow(), project?.pack?.outputDir ?? 'builds')
+  const exportBaseNow = async () => resolvePath(await rootNow(), 'build/exports')
+
+  const latestBuild = async (project) => {
+    const dir = await buildsDirNow(project)
+    try {
+      const entries = await readdir(dir, { withFileTypes: true })
+      const packs = []
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.endsWith('.mrpack')) continue
+        const info = await stat(join(dir, entry.name))
+        packs.push({ name: entry.name, path: join(dir, entry.name), size: info.size, modified: info.mtime.toISOString() })
+      }
+      packs.sort((a, b) => b.modified.localeCompare(a.modified))
+      return packs[0]
+    } catch {
+      return undefined
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Operation history
+  // -------------------------------------------------------------------------
+  const historyPathNow = async () => join(await rootNow(), HISTORY_FILE)
+  const readHistory = async () => {
+    try {
+      return JSON.parse(await readFile(await historyPathNow(), 'utf8'))
+    } catch {
+      return []
+    }
+  }
+  const recordHistory = async (entry) => {
+    const path = await historyPathNow()
+    const history = await readHistory()
+    history.unshift({ time: new Date().toISOString(), ...entry })
+    await mkdir(join(path, '..'), { recursive: true })
+    await writeFile(path, `${JSON.stringify(history.slice(0, MAX_HISTORY), null, 2)}\n`, 'utf8')
+    return history.slice(0, MAX_HISTORY)
+  }
+
+  // -------------------------------------------------------------------------
+  // Managers
+  // -------------------------------------------------------------------------
+  const projectManager = {
+    async load() {
+      return readProject(await projectPathNow())
+    },
+    async summary() {
+      const project = await this.load()
+      return projectSummary(project)
+    },
+    async readState() {
+      const root = await rootNow()
+      const projectPath = await projectPathNow()
+      let project
+      try {
+        project = await readProject(projectPath)
+      } catch {
+        project = undefined
+      }
+      const designRoot = await designRootNow(project)
+      let design = { total: 0, totals: {}, errors: [], warnings: [], ok: true }
+      try {
+        const report = await checkDesign(designRoot)
+        design = {
+          total: report.total,
+          totals: report.stats,
+          errors: report.errors.slice(0, 12),
+          warnings: report.warnings.slice(0, 12),
+          ok: report.ok,
+          info: report.info,
+        }
+      } catch (error) {
+        design = { total: 0, totals: {}, errors: [error.message], warnings: [], ok: false }
+      }
+      const buildsDir = await buildsDirNow(project)
+      const builds = []
+      try {
+        for (const entry of await readdir(buildsDir, { withFileTypes: true })) {
+          if (!entry.isFile() || !entry.name.endsWith('.mrpack')) continue
+          const info = await stat(join(buildsDir, entry.name))
+          builds.push({ name: entry.name, size: info.size, modified: info.mtime.toISOString() })
+        }
+        builds.sort((a, b) => b.modified.localeCompare(a.modified))
+      } catch {
+        /* no builds */
+      }
+      const exportsInfo = {}
+      for (const target of EXPORT_TARGETS) {
+        try {
+          const files = await walkFiles(resolvePath(await rootNow(), 'build/exports', target))
+          exportsInfo[target] = { present: files.length > 0, files: files.length }
+        } catch {
+          exportsInfo[target] = { present: false, files: 0 }
+        }
+      }
+      let serverMods = null
+      const serverDir = await serverDirNow(project)
+      try {
+        serverMods = (await readdir(join(serverDir, 'mods'))).filter((name) => name.endsWith('.jar')).length
+      } catch {
+        serverMods = null
+      }
+      const history = await readHistory()
+      return {
+        ok: true,
+        generatedAt: new Date().toISOString(),
+        workspaceRoot: root,
+        projectFile: projectPath,
+        hasProject: Boolean(project),
+        project: project ? projectSummary(project) : null,
+        modsDetailed: project ? project.pack.mods : [],
+        design,
+        builds: builds.slice(0, 8),
+        buildsTotal: builds.length,
+        exports: exportsInfo,
+        serverMods,
+        serverDir,
+        history: history.slice(0, 12),
+      }
+    },
+    async update(patch) {
+      const project = await this.load()
+      if (patch.name) project.name = String(patch.name)
+      if (patch.versionId) project.pack.versionId = String(patch.versionId)
+      if (patch.minecraft) project.target.minecraft = String(patch.minecraft)
+      if (patch.loader) project.target.loader = String(patch.loader)
+      await writeProject(await projectPathNow(), project)
+      return projectSummary(project)
+    },
+  }
+
+  const modManager = {
+    async list(resolve) {
+      const project = await projectManager.load()
+      if (!resolve) return { mods: project.pack.mods, warnings: [] }
+      const plan = await resolveProject(config, project, AbortSignal.timeout(60000))
+      return {
+        mods: project.pack.mods,
+        warnings: plan.warnings,
+        plan: plan.entries.map((entry) => ({
+          id: entry.slug,
+          title: entry.title,
+          version: entry.versionNumber,
+          clientSide: entry.clientSide,
+          serverSide: entry.serverSide,
+          filename: entry.filename,
+          direct: entry.direct,
+        })),
+      }
+    },
+    async run(body) {
+      const file = await projectPathNow()
+      const project = await readProject(file)
+      const refs = Array.isArray(body.refs) ? body.refs.filter(Boolean) : []
+      const action = body.action
+      if (!['add', 'remove', 'pin', 'unpin'].includes(action)) throw new Error(`未知的模组操作：${action}`)
+      if (!refs.length) throw new Error('缺少 refs')
+      let changed = []
+      if (action === 'add') changed = addMods(project, refs)
+      else if (action === 'remove') changed = removeMods(project, refs)
+      else if (action === 'pin') changed = [pinMod(project, refs[0], body.versionId)]
+      else changed = unpinMod(project, refs)
+      await writeProject(file, project)
+      return { action, changed: changed.map((mod) => mod.id ?? mod), mods: project.pack.mods }
+    },
+  }
+
+  const designManager = {
+    async list(kind) {
+      return listEntries(await designRootNow(await projectManager.load().catch(() => undefined)), kind)
+    },
+    async get(kind, id) {
+      return getEntry(await designRootNow(await projectManager.load().catch(() => undefined)), kind, id)
+    },
+    async run(body) {
+      const root = await designRootNow(await projectManager.load().catch(() => undefined))
+      if (body.action === 'write') {
+        if (!body.kind || !body.id || !body.data) throw new Error('write 需要 kind/id/data')
+        const result = await writeEntry(root, body.kind, body.id, body.data, { replace: Boolean(body.replace) })
+        let relevant = []
+        try {
+          const report = await checkDesign(root)
+          relevant = [...report.errors, ...report.warnings].filter((message) => message.includes(`[${body.kind}/${body.id}]`))
+        } catch {
+          /* best effort */
+        }
+        return { path: result.path, created: result.created, validation: result.validation, relevant }
+      }
+      if (body.action === 'delete') {
+        if (!body.kind || !body.id) throw new Error('delete 需要 kind/id')
+        return deleteEntry(root, body.kind, body.id)
+      }
+      if (body.action === 'check') {
+        return checkDesign(root)
+      }
+      throw new Error(`未知的设计操作：${body.action}`)
+    },
+    async schema(kind) {
+      if (kind) return DESIGN_KINDS[kind] ?? null
+      return DESIGN_KINDS
+    },
+  }
+
+  const exportManager = {
+    async run(target) {
+      const root = await rootNow()
+      const project = await projectManager.load().catch(() => undefined)
+      const designRoot = await designRootNow(project)
+      const exportBase = await exportBaseNow()
+      const namespace = project?.id ?? config.defaultNamespace
+      const language = 'zh_cn'
+      const targets = target === 'all' ? EXPORT_TARGETS : [target]
+      const results = []
+      for (const item of targets) {
+        try {
+          let result
+          if (item === 'design-wiki') result = await exportDesignWiki(designRoot, resolvePath(exportBase, 'design-wiki'))
+          else if (item === 'ftbquests') result = await exportFtbQuests({ config, project, designRoot, projectRoot: root, outDir: resolvePath(exportBase, 'ftbquests'), namespace, language })
+          else if (item === 'patchouli') result = await exportPatchouli({ config, project, designRoot, projectRoot: root, outDir: resolvePath(exportBase, 'patchouli'), namespace, language })
+          else if (item === 'kubejs') result = await exportKubeJs({ config, project, designRoot, projectRoot: root, outDir: resolvePath(exportBase, 'kubejs'), namespace, language })
+          results.push({ target: item, ok: true, outDir: result.outDir, summary: result.summary, warnings: result.warnings ?? [] })
+        } catch (error) {
+          results.push({ target: item, ok: false, error: error.message })
+        }
+      }
+      await recordHistory({
+        action: 'export',
+        target,
+        ok: results.every((result) => result.ok),
+        detail: results.map((result) => `${result.target}:${result.ok ? 'ok' : 'failed'}`).join(', '),
+      })
+      return results
+    },
+  }
+
+  const buildManager = {
+    async run(body) {
+      const root = await rootNow()
+      const file = await projectPathNow()
+      const result = await buildFromProject(
+        config,
+        { projectRoot: root, projectPath: file, versionId: body.versionId, includeOptional: Boolean(body.includeOptional) },
+        AbortSignal.timeout(180000),
+      )
+      await recordHistory({
+        action: 'build',
+        ok: true,
+        detail: `${result.outputPath} · ${result.files} mods · ${result.contentFiles ?? 0} content files`,
+      })
+      return {
+        outputPath: result.outputPath,
+        size: result.size,
+        sha1: result.sha1,
+        files: result.files,
+        overrides: result.overrides,
+        contentFiles: result.contentFiles,
+        dependencies: result.dependencies,
+        warnings: result.warnings,
+        contentWarnings: result.contentWarnings,
+      }
+    },
+    async list() {
+      const project = await projectManager.load().catch(() => undefined)
+      const dir = await buildsDirNow(project)
+      try {
+        const entries = await readdir(dir, { withFileTypes: true })
+        const packs = []
+        for (const entry of entries) {
+          if (!entry.isFile() || !entry.name.endsWith('.mrpack')) continue
+          const info = await stat(join(dir, entry.name))
+          packs.push({ name: entry.name, path: join(dir, entry.name), size: info.size, modified: info.mtime.toISOString() })
+        }
+        packs.sort((a, b) => b.modified.localeCompare(a.modified))
+        return packs
+      } catch {
+        return []
+      }
+    },
+  }
+
+  const serverManager = {
+    async state() {
+      const project = await projectManager.load().catch(() => undefined)
+      const dir = await serverDirNow(project)
+      const latest = await latestBuild(project)
+      let modsCount = null
+      try {
+        modsCount = (await readdir(join(dir, 'mods'))).filter((name) => name.endsWith('.jar')).length
+      } catch {
+        modsCount = null
+      }
+      let check = null
+      let checkError
+      if (latest) {
+        try {
+          check = await checkPackAgainstServer(latest.path, dir)
+        } catch (error) {
+          checkError = error.message
+        }
+      }
+      return {
+        dir,
+        exists: await stat(dir).then((info) => info.isDirectory()).catch(() => false),
+        modsCount,
+        latestBuild: latest ? { name: latest.name, size: latest.size, modified: latest.modified } : null,
+        check,
+        checkError,
+        statusTarget: {
+          host: project?.operations?.statusHost ?? '',
+          port: project?.operations?.statusPort ?? 25565,
+        },
+      }
+    },
+    async status(host, port) {
+      const targetHost = String(host || '').trim()
+      if (!targetHost) throw new Error('缺少服务器地址')
+      let srv
+      let targetPort = port
+      if (targetPort === undefined || targetPort === null || targetPort === '') {
+        srv = await resolveMinecraftSrv(targetHost)
+        targetPort = srv?.port ?? 25565
+      }
+      const status = await pingServer({ host: srv?.host ?? targetHost, port: targetPort, timeoutMs: 8000 })
+      await recordHistory({ action: 'server-status', ok: true, detail: `${targetHost}:${targetPort} ${status.playersOnline}/${status.playersMax}` })
+      return { ...status, targetHost: srv?.host ?? targetHost, port: targetPort, srv }
+    },
+    async install() {
+      const project = await projectManager.load()
+      const latest = await latestBuild(project)
+      if (!latest) throw new Error('还没有构建产物，请先构建整合包')
+      const dir = await serverDirNow(project)
+      const result = await installMrpackToServer(config, { packPath: latest.path, serverDir: dir }, AbortSignal.timeout(300000))
+      await recordHistory({ action: 'server-install', ok: result.failed.length === 0, detail: `${latest.name} → ${dir}（${result.downloaded.length} 个文件）` })
+      return { build: latest.name, ...result }
+    },
+    async check() {
+      const project = await projectManager.load()
+      const latest = await latestBuild(project)
+      if (!latest) throw new Error('还没有构建产物，请先构建整合包')
+      const dir = await serverDirNow(project)
+      const result = await checkPackAgainstServer(latest.path, dir)
+      await recordHistory({ action: 'server-check', ok: result.ok, detail: `${latest.name} vs ${dir}` })
+      return { build: latest.name, ...result }
+    },
+    async backup() {
+      const project = await projectManager.load().catch(() => undefined)
+      const dir = await serverDirNow(project)
+      const root = await rootNow()
+      const backupDir = resolvePath(root, 'build/backups')
+      await mkdir(backupDir, { recursive: true })
+      const candidates = ['world', 'world_nether', 'world_the_end', 'config', 'plugins', 'mods', 'server.properties', 'eula.txt', 'ops.json', 'whitelist.json', 'banned-players.json', 'banned-ips.json']
+      const files = []
+      for (const relative of candidates) {
+        try {
+          const filesFound = await walkFiles(join(dir, relative))
+          for (const file of filesFound) files.push({ name: `${relative}/${file.relativePath}`, absolutePath: file.absolutePath })
+        } catch {
+          try {
+            const info = await stat(join(dir, relative))
+            if (info.isFile()) files.push({ name: relative, absolutePath: join(dir, relative) })
+          } catch {
+            /* skip missing entry */
+          }
+        }
+      }
+      if (!files.length) throw new Error('没有找到可备份的服务端文件（先运行 mc_server_config / 部署服务端）')
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      const name = `server-backup-${stamp}.zip`
+      const buffers = []
+      for (const file of files) buffers.push({ name: file.name, data: await readFile(file.absolutePath) })
+      const zip = createZip(buffers)
+      await writeFile(join(backupDir, name), zip)
+      await recordHistory({ action: 'server-backup', ok: true, detail: `${name} · ${files.length} 个文件 · ${zip.length} 字节` })
+      return { name, path: join(backupDir, name), files: files.length, size: zip.length }
+    },
+    async backups() {
+      const root = await rootNow()
+      const dir = resolvePath(root, 'build/backups')
+      try {
+        const entries = await readdir(dir, { withFileTypes: true })
+        const backups = []
+        for (const entry of entries) {
+          if (!entry.isFile() || !entry.name.endsWith('.zip')) continue
+          const info = await stat(join(dir, entry.name))
+          backups.push({ name: entry.name, size: info.size, modified: info.mtime.toISOString() })
+        }
+        backups.sort((a, b) => b.modified.localeCompare(a.modified))
+        return backups
+      } catch {
+        return []
+      }
+    },
+    async generate(body) {
+      const project = await projectManager.load()
+      const dir = await serverDirNow(project)
+      const kind = body.kind ?? (project.target.loader === 'fabric' ? 'fabric' : 'neoforge')
+      const result = await generateServerConfig(
+        config,
+        {
+          kind,
+          dir,
+          gameVersion: project.target.minecraft,
+          loaderVersion: project.target.loaderVersion || undefined,
+          overwrite: Boolean(body.overwrite),
+          downloadJar: Boolean(body.downloadJar),
+          settings: { motd: project.operations?.motd ?? `${project.name} 服务器`, maxPlayers: project.operations?.maxPlayers ?? 30 },
+        },
+        AbortSignal.timeout(180000),
+      )
+      await recordHistory({ action: 'server-config', ok: true, detail: `${kind} → ${dir}（${result.files.length} 个文件）` })
+      return { dir: result.dir, kind: result.kind, files: result.files, notes: result.notes }
+    },
+  }
+
+  // -------------------------------------------------------------------------
+  // Route dispatch
+  // -------------------------------------------------------------------------
+  const dispatch = async (req, res) => {
+    const url = new URL(req.url ?? '/', 'http://localhost')
+    const path = url.pathname.replace(/^\/craft-workshop\/api/, '') || '/'
+    const method = req.method ?? 'GET'
+    const wantsWrite = method === 'POST' || method === 'DELETE'
+    if (wantsWrite && !isLoopback(req.socket?.remoteAddress)) {
+      return sendJson(res, 403, { ok: false, error: '只允许本机访问' })
+    }
+    let body = {}
+    if (wantsWrite) {
+      try {
+        body = await readJsonBody(req)
+      } catch (error) {
+        return sendJson(res, 400, { ok: false, error: error.message })
+      }
+    }
+    try {
+      if (method === 'GET' && path === '/state') return sendJson(res, 200, await projectManager.readState())
+      if (method === 'GET' && path === '/history') return sendJson(res, 200, { ok: true, history: await readHistory() })
+      if (method === 'GET' && path === '/mods') {
+        return sendJson(res, 200, { ok: true, ...(await modManager.list(url.searchParams.get('resolve') === '1')) })
+      }
+      if (method === 'POST' && path === '/mods') return sendJson(res, 200, { ok: true, ...(await modManager.run(body)) })
+      if (method === 'GET' && path === '/design') {
+        const kind = url.searchParams.get('kind')
+        const id = url.searchParams.get('id')
+        if (!kind) return sendJson(res, 200, { ok: true, kinds: DESIGN_KINDS })
+        if (id) return sendJson(res, 200, { ok: true, entry: await designManager.get(kind, id) })
+        return sendJson(res, 200, { ok: true, ...(await designManager.list(kind)) })
+      }
+      if (method === 'POST' && path === '/design') return sendJson(res, 200, { ok: true, ...(await designManager.run(body)) })
+      if (method === 'POST' && path === '/export') {
+        return sendJson(res, 200, { ok: true, results: await exportManager.run(body.target ?? 'all') })
+      }
+      if (method === 'POST' && path === '/build') return sendJson(res, 200, { ok: true, ...(await buildManager.run(body)) })
+      if (method === 'GET' && path === '/builds') return sendJson(res, 200, { ok: true, builds: await buildManager.list() })
+      if (method === 'GET' && path === '/server') return sendJson(res, 200, { ok: true, ...(await serverManager.state()) })
+      if (method === 'GET' && path === '/backups') return sendJson(res, 200, { ok: true, backups: await serverManager.backups() })
+      if (method === 'POST' && path === '/server') {
+        const action = body.action
+        if (action === 'status') return sendJson(res, 200, { ok: true, status: await serverManager.status(body.host, body.port) })
+        if (action === 'install') return sendJson(res, 200, { ok: true, result: await serverManager.install() })
+        if (action === 'check') return sendJson(res, 200, { ok: true, result: await serverManager.check() })
+        if (action === 'backup') return sendJson(res, 200, { ok: true, result: await serverManager.backup() })
+        if (action === 'generate') return sendJson(res, 200, { ok: true, result: await serverManager.generate(body) })
+        return sendJson(res, 400, { ok: false, error: `未知的服务器操作：${action}` })
+      }
+      return sendJson(res, 404, { ok: false, error: `未知接口：${method} ${path}` })
+    } catch (error) {
+      return sendJson(res, 500, { ok: false, error: error.message })
+    }
+  }
+
+  let disposer
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['webServer'], (child) => {
+      child.effect(() => {
+        disposer = child.webServer.register({ kind: 'prefix', path: '/craft-workshop/api', handler: dispatch })
+        return disposer
+      })
+    })
+  } else {
+    const webServer = typeof ctx.get === 'function' ? ctx.get('webServer') : undefined
+    if (webServer) disposer = webServer.register({ kind: 'prefix', path: '/craft-workshop/api', handler: dispatch })
+  }
+  return () => disposer?.()
+}

@@ -7,8 +7,18 @@ import { createHash } from 'node:crypto'
 
 const CACHE = new Map()
 
+/** Turn low-level fetch failures (DNS, connect timeout) into an actionable message. */
+function describeFetchError(error, url) {
+  const message = String(error?.message ?? error)
+  const cause = error?.cause?.message ?? error?.cause?.code ?? ''
+  if (error?.name === 'TypeError' || /fetch failed|connect timeout|ENOTFOUND|EAI_AGAIN/i.test(message + ' ' + cause)) {
+    return new Error(`网络请求失败：${url}${cause ? ` — ${cause}` : ''}（请检查本机 DNS / 网络连接）`)
+  }
+  return error
+}
+
 /** Default UA used when the plugin config does not provide one (Modrinth requires a UA). */
-export const DEFAULT_USER_AGENT = 'craft-workshop/0.3.0 (https://ipthmc.zyghit.cn)'
+export const DEFAULT_USER_AGENT = 'craft-workshop/0.4.0 (https://ipthmc.zyghit.cn)'
 
 export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -74,7 +84,7 @@ export async function getJson(url, { config = {}, signal, ttlMs, headers = {}, r
         return value
       }
     } catch (error) {
-      lastError = error
+      lastError = describeFetchError(error, url)
       if (signal?.aborted) throw signal.reason ?? new Error('request aborted')
       if (error?.status && error.status !== 429 && error.status < 500) throw error
     } finally {
@@ -107,7 +117,7 @@ export async function getText(url, { config = {}, signal, headers = {}, retries 
         return await res.text()
       }
     } catch (error) {
-      lastError = error
+      lastError = describeFetchError(error, url)
       if (signal?.aborted) throw signal.reason ?? new Error('request aborted')
       if (error?.status && error.status !== 429 && error.status < 500) throw error
     } finally {
@@ -128,6 +138,8 @@ export async function getBytes(url, { config = {}, signal, timeoutMs } = {}) {
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} for ${url}`)
     const buffer = Buffer.from(await res.arrayBuffer())
     return buffer
+  } catch (error) {
+    throw describeFetchError(error, url)
   } finally {
     scoped.dispose()
   }

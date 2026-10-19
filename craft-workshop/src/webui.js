@@ -20,6 +20,7 @@ import {
   DESIGN_KINDS,
   checkDesign,
   deleteEntry,
+  ensureDesignScaffold,
   exportDesignWiki,
   getEntry,
   listEntries,
@@ -30,6 +31,7 @@ import { checkPackAgainstServer } from './packcheck.js'
 import {
   addMods,
   buildFromProject,
+  defaultProject,
   pinMod,
   projectSummary,
   readProject,
@@ -42,6 +44,7 @@ import { installMrpackToServer, walkFiles } from './mrpack.js'
 import { pingServer, resolveMinecraftSrv } from './ping.js'
 import { generateServerConfig } from './servercfg.js'
 import { createZip } from './zip.js'
+import { createProjectRegistry, slugifyProject } from './registry.js'
 
 const EXPORT_TARGETS = ['design-wiki', 'ftbquests', 'patchouli', 'kubejs']
 const HISTORY_FILE = '.craft-workshop/history.json'
@@ -92,11 +95,39 @@ function sendJson(res, status, value) {
 export function registerWebUi(ctx, config, helpers) {
   const { getRoot, outPath } = helpers
 
-  const rootNow = async () => {
+  const registry = createProjectRegistry(config)
+
+  /**
+   * The project this request works on. The UI sends `?project=<id>` (empty string means
+   * "the session workspace"); without the parameter the registry's active project wins.
+   * The API is local and single-user, so one request-scoped field is enough.
+   */
+  let requestTarget
+  const resolveTarget = async (projectRef) => {
+    if (projectRef === '') {
+      const root = await getRoot()
+      return { root, file: outPath(root, config.projectFile), entry: undefined }
+    }
+    if (projectRef) {
+      const entry = await registry.get(projectRef)
+      if (!entry) throw new Error(`未注册的项目：${projectRef}`)
+      await registry.touch(entry.id)
+      return { root: entry.root, file: outPath(entry.root, entry.projectFile || config.projectFile), entry }
+    }
+    const active = await registry.active()
+    if (active) return { root: active.root, file: outPath(active.root, active.projectFile || config.projectFile), entry: active }
     const root = await getRoot()
-    return root
+    return { root, file: outPath(root, config.projectFile), entry: undefined }
   }
-  const projectPathNow = async () => outPath(await rootNow(), config.projectFile)
+
+  const rootNow = async () => {
+    if (requestTarget) return requestTarget.root
+    return (await resolveTarget(undefined)).root
+  }
+  const projectPathNow = async () => {
+    if (requestTarget) return requestTarget.file
+    return (await resolveTarget(undefined)).file
+  }
   const designRootNow = async (project) => resolvePath(await rootNow(), project?.design?.root ?? config.designRoot)
   const serverDirNow = async (project) => outPath(await rootNow(), project?.servers?.mod?.dir ?? 'server/neoforge')
   const buildsDirNow = async (project) => outPath(await rootNow(), project?.pack?.outputDir ?? 'builds')
@@ -143,6 +174,82 @@ export function registerWebUi(ctx, config, helpers) {
   // Managers
   // -------------------------------------------------------------------------
   const projectManager = {
+    async list() {
+      const listing = await registry.list()
+      const projects = []
+      for (const entry of listing.projects) {
+        const exists = await stat(join(entry.root, entry.projectFile || config.projectFile))
+          .then(() => true)
+          .catch(() => false)
+        projects.push({ ...entry, exists })
+      }
+      return {
+        registryFile: listing.file,
+        active: listing.active,
+        projects,
+        workspaceRoot: await getRoot(),
+      }
+    },
+    async create(body) {
+      if (!body.name) throw new Error('创建项目需要 name')
+      const template = body.template ?? 'modpack'
+      const dirArg = body.dir ?? slugifyProject(body.name)
+      const dir = dirArg.startsWith('/') ? dirArg : resolvePath(await getRoot(), dirArg)
+      const projectFile = resolvePath(dir, config.projectFile)
+      if (await stat(projectFile).then(() => true).catch(() => false)) {
+        throw new Error(`目录里已有工程文件：${projectFile}（用「注册现有目录」接管）`)
+      }
+      const project = defaultProject(body.name)
+      project.kind = template === 'server' ? 'server' : template === 'empty' ? 'empty' : 'modpack'
+      if (body.minecraft) project.target.minecraft = body.minecraft
+      if (body.loader) project.target.loader = body.loader
+      if (body.loaderVersion) project.target.loaderVersion = body.loaderVersion
+      if (Array.isArray(body.mods) && body.mods.length) addMods(project, body.mods.filter(Boolean))
+      if (template === 'server') project.servers = { mod: { kind: project.target.loader, dir: 'server' } }
+      await mkdir(dir, { recursive: true })
+      await writeProject(projectFile, project)
+      if (template !== 'empty') await ensureDesignScaffold(resolvePath(dir, project.design?.root ?? config.designRoot))
+      await mkdir(resolvePath(dir, project.pack.overrides?.overrides || 'overrides'), { recursive: true })
+      await mkdir(resolvePath(dir, project.pack.outputDir || 'builds'), { recursive: true })
+      const entry = await registry.register({
+        root: dir,
+        name: project.name,
+        projectFile: config.projectFile,
+        kind: project.kind,
+        source: 'created',
+        activate: body.use !== false,
+      })
+      await recordHistory({ action: 'project-create', ok: true, detail: `${entry.id} → ${dir}` })
+      return { entry, dir, projectFile, template }
+    },
+    async register(body) {
+      const dirArg = body.dir
+      if (!dirArg) throw new Error('注册项目需要 dir')
+      const dir = dirArg.startsWith('/') ? dirArg : resolvePath(await getRoot(), dirArg)
+      const projectFile = resolvePath(dir, config.projectFile)
+      let project
+      try {
+        project = await readProject(projectFile)
+      } catch (error) {
+        throw new Error(`目录里没有可用的工程文件：${error.message}`)
+      }
+      const entry = await registry.register({
+        root: dir,
+        name: body.name ?? project.name,
+        projectFile: config.projectFile,
+        kind: project.kind ?? 'modpack',
+        source: 'registered',
+        activate: body.use === true,
+      })
+      return { entry, dir, projectFile }
+    },
+    async use(id) {
+      return { active: await registry.setActive(id ?? '') }
+    },
+    async remove(id) {
+      if (!id) throw new Error('移除项目需要 project id')
+      return registry.remove(id)
+    },
     async load() {
       return readProject(await projectPathNow())
     },
@@ -521,6 +628,13 @@ export function registerWebUi(ctx, config, helpers) {
     const url = new URL(req.url ?? '/', 'http://localhost')
     const path = url.pathname.replace(/^\/craft-workshop\/api/, '') || '/'
     const method = req.method ?? 'GET'
+    const projectParam = url.searchParams.has('project') ? url.searchParams.get('project') : undefined
+    try {
+      requestTarget = await resolveTarget(projectParam)
+    } catch (error) {
+      requestTarget = undefined
+      return sendJson(res, 404, { ok: false, error: error.message })
+    }
     const wantsWrite = method === 'POST' || method === 'DELETE'
     if (wantsWrite && !isLoopback(req.socket?.remoteAddress)) {
       return sendJson(res, 403, { ok: false, error: '只允许本机访问' })
@@ -534,7 +648,28 @@ export function registerWebUi(ctx, config, helpers) {
       }
     }
     try {
-      if (method === 'GET' && path === '/state') return sendJson(res, 200, await projectManager.readState())
+      if (method === 'GET' && path === '/projects') return sendJson(res, 200, { ok: true, ...(await projectManager.list()) })
+      if (method === 'POST' && path === '/projects') {
+        const action = body.action
+        if (action === 'create') return sendJson(res, 200, { ok: true, ...(await projectManager.create(body)) })
+        if (action === 'register') return sendJson(res, 200, { ok: true, ...(await projectManager.register(body)) })
+        if (action === 'use') return sendJson(res, 200, { ok: true, ...(await projectManager.use(body.project)) })
+        if (action === 'remove') return sendJson(res, 200, { ok: true, ...(await projectManager.remove(body.project)) })
+        return sendJson(res, 400, { ok: false, error: `未知的项目操作：${action}` })
+      }
+      if (method === 'GET' && path === '/state') {
+        const state = await projectManager.readState()
+        return sendJson(res, 200, {
+          ok: true,
+          ...state,
+          target: {
+            root: requestTarget?.root ?? state.workspaceRoot,
+            id: requestTarget?.entry?.id ?? '',
+            name: requestTarget?.entry?.name ?? '',
+            kind: requestTarget?.entry?.kind ?? '',
+          },
+        })
+      }
       if (method === 'GET' && path === '/history') return sendJson(res, 200, { ok: true, history: await readHistory() })
       if (method === 'GET' && path === '/mods') {
         return sendJson(res, 200, { ok: true, ...(await modManager.list(url.searchParams.get('resolve') === '1')) })

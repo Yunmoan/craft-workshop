@@ -10,6 +10,7 @@
  *  - modpack ↔ server mod directory consistency checks
  */
 import { mkdir, stat } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
 import { isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { formatBytes, formatDate, formatTable, truncate } from './src/util.js'
 import {
@@ -38,6 +39,7 @@ import {
 } from './src/design.js'
 import { exportFtbQuests, exportKubeJs, exportPatchouli } from './src/exporters.js'
 import { registerWebUi } from './src/webui.js'
+import { createProjectRegistry, slugifyProject } from './src/registry.js'
 import {
   addMods,
   buildFromProject,
@@ -65,6 +67,7 @@ const DEFAULTS = {
   projectFile: 'project.json',
   designRoot: 'design',
   defaultNamespace: 'ipthmc',
+  registryFile: '',
 }
 
 const PROJECT_TYPES = ['mod', 'plugin', 'modpack', 'resourcepack', 'shader', 'datapack']
@@ -158,10 +161,33 @@ export function apply(ctx, rawConfig) {
     return isAbsolute(raw) ? raw : resolvePath(root, raw)
   }
 
-  /** Absolute path of the project file for one call. */
-  const projectFileFor = async (exec, pathArg) => {
+  const registry = createProjectRegistry(config)
+
+  /**
+   * Resolve which project a call works on: an explicit registry id wins, otherwise the
+   * session workspace is used (so an agent keeps working where it was started).
+   */
+  const targetFor = async (exec, projectRef, pathArg) => {
+    if (projectRef) {
+      const entry = await registry.get(projectRef)
+      if (!entry) {
+        throw new Error(`未注册的项目 "${projectRef}"：先 mc_project action=list 查看，或用 action=register 注册目录`)
+      }
+      await registry.touch(entry.id)
+      return {
+        root: entry.root,
+        file: outPath(entry.root, pathArg ?? entry.projectFile ?? config.projectFile),
+        entry,
+      }
+    }
     const root = await sessionRoot(exec)
-    return { root, file: outPath(root, pathArg ?? config.projectFile) }
+    return { root, file: outPath(root, pathArg ?? config.projectFile), entry: undefined }
+  }
+
+  /** Absolute path of the project file for one call. */
+  const projectFileFor = async (exec, pathArg, projectRef) => {
+    const target = await targetFor(exec, projectRef, pathArg)
+    return { root: target.root, file: target.file, entry: target.entry }
   }
 
   /** Absolute design root: explicit override > project.json design.root > plugin config. */
@@ -175,9 +201,9 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  const projectPaths = async (exec, pathArg) => {
-    const { root, file } = await projectFileFor(exec, pathArg)
-    return { root, file, designRoot: await designRootFor(root, file) }
+  const projectPaths = async (exec, pathArg, projectRef) => {
+    const { root, file, entry } = await projectFileFor(exec, pathArg, projectRef)
+    return { root, file, entry, designRoot: await designRootFor(root, file) }
   }
 
   // ---------------------------------------------------------------------------
@@ -797,13 +823,23 @@ export function apply(ctx, rawConfig) {
   const projectManageTool = defineTool({
     name: 'mc_project',
     description:
-      '整合包工程管理（制作工具入口）：查看工程摘要、初始化设计/覆盖/构建目录、修改包名/版本/目标 MC 版本与加载器/输出目录/设计目录。' +
-      '工程文件（默认 project.json）是唯一事实源；整合包构建产物只是输出，日常创作请改工程文件与 design/ 内容。',
+      '通用工程管理（制作工具入口）：list 项目列表 / create 新建项目 / register 注册已有目录 / use 切换当前项目 / remove 移出注册表 / show 查看 / init 初始化目录 / update 修改工程字段。' +
+      '工程文件（默认 project.json）是唯一事实源；构建产物只是输出。多项目通过注册表（默认 ~/.craft-workshop/projects.json）管理，其他工具可用 project 参数指定项目。',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['show', 'init', 'update'], description: 'show 查看 / init 初始化 / update 修改' },
+        action: {
+          type: 'string',
+          enum: ['show', 'init', 'update', 'list', 'create', 'register', 'use', 'remove'],
+          description: 'show 查看 / init 初始化 / update 修改 / list 项目列表 / create 新建项目 / register 注册目录 / use 切换激活项目 / remove 移出注册表',
+        },
         path: { type: 'string', description: '工程文件路径，默认 project.json' },
+        project: { type: 'string', description: '注册表项目 id（use/remove/list 时的目标，其他动作也可用它指定项目）' },
+        dir: { type: 'string', description: 'create/register 的目标目录（绝对路径或相对会话目录）' },
+        template: { type: 'string', enum: ['modpack', 'server', 'empty'], description: 'create 的模板：modpack（默认，含设计目录）/ server / empty' },
+        mods: { type: 'array', items: { type: 'string' }, description: 'create 时的种子模组列表（slug 或 slug@versionId）' },
+        git: { type: 'boolean', description: 'create 时是否执行 git init（默认 false）' },
+        use: { type: 'boolean', description: 'create/register 后是否切换为当前项目（create 默认 true）' },
         name: { type: 'string', description: '整合包名称' },
         versionId: { type: 'string', description: '整合包版本标识' },
         summary: { type: 'string', description: '整合包简介' },
@@ -817,8 +853,139 @@ export function apply(ctx, rawConfig) {
       additionalProperties: false,
     },
     async execute(args, exec) {
-      const { root } = await projectFileFor(exec, args.path)
-      const file = outPath(root, args.path ?? config.projectFile)
+      const sessionRootPath = await sessionRoot(exec)
+      const target = await targetFor(exec, args.project, args.path)
+      const root = target.root
+      const file = target.file
+
+      if (args.action === 'list') {
+        const listing = await registry.list()
+        const rows = []
+        for (const entry of listing.projects) {
+          const exists = await stat(join(entry.root, entry.projectFile || config.projectFile))
+            .then(() => true)
+            .catch(() => false)
+          rows.push([entry.id, entry.name, exists ? '✅' : '❌ 工程文件缺失', entry.kind, entry.root])
+        }
+        const lines = [
+          `已注册项目：${listing.projects.length} 个`,
+          `注册表：${listing.file}`,
+          listing.active ? `当前激活项目：${listing.active}` : '当前激活项目：（无；工具默认使用会话工作目录）',
+          '',
+        ]
+        lines.push(rows.length ? formatTable(['id', '名称', '状态', '类型', '目录'], rows) : '（还没有项目：mc_project action=create 新建，或 action=register 注册已有目录）')
+        lines.push('', '切换：mc_project action=use project=<id>；Web UI 顶部也有项目下拉。')
+        return { tool: 'mc_project', action: 'list', registry: listing, text: lines.join('\n') }
+      }
+
+      if (args.action === 'create') {
+        if (!args.name) throw new Error('create 需要 name')
+        const template = args.template ?? 'modpack'
+        const dirArg = args.dir ?? slugifyProject(args.name)
+        const dir = isAbsolute(dirArg) ? dirArg : resolvePath(sessionRootPath, dirArg)
+        const projectFile = resolvePath(dir, config.projectFile)
+        if (await stat(projectFile).then(() => true).catch(() => false)) {
+          throw new Error(`目录里已有工程文件：${projectFile}（要接管现有项目请用 action=register）`)
+        }
+        const project = defaultProject(args.name)
+        project.kind = template === 'server' ? 'server' : template === 'empty' ? 'empty' : 'modpack'
+        if (args.minecraft) project.target.minecraft = args.minecraft
+        if (args.loader) project.target.loader = args.loader
+        if (args.loaderVersion) project.target.loaderVersion = args.loaderVersion
+        if (Array.isArray(args.mods) && args.mods.length) addMods(project, args.mods)
+        if (template === 'server') {
+          project.servers = { mod: { kind: project.target.loader, dir: 'server' } }
+        }
+        await mkdir(dir, { recursive: true })
+        await writeProject(projectFile, project)
+        const notes = []
+        if (template !== 'empty') {
+          const designRoot = resolvePath(dir, project.design?.root ?? config.designRoot)
+          await ensureDesignScaffold(designRoot)
+          notes.push(`设计目录：${designRoot}`)
+        }
+        const overridesDir = resolvePath(dir, project.pack.overrides?.overrides || 'overrides')
+        const outputDir = resolvePath(dir, project.pack.outputDir || 'builds')
+        await mkdir(overridesDir, { recursive: true })
+        await mkdir(outputDir, { recursive: true })
+        if (args.git) {
+          try {
+            execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir, stdio: 'ignore' })
+            notes.push('已初始化 git 仓库')
+          } catch (error) {
+            notes.push(`git init 失败（可手动执行）：${error.message}`)
+          }
+        }
+        const entry = await registry.register({
+          root: dir,
+          name: project.name,
+          projectFile: config.projectFile,
+          kind: project.kind,
+          source: 'created',
+          activate: args.use !== false,
+        })
+        const lines = [
+          `已创建项目：${project.name}（${entry.id}）`,
+          `目录：${dir}`,
+          `模板：${template} | 目标：Minecraft ${project.target.minecraft} / ${project.target.loader} ${project.target.loaderVersion || '（自动）'}`,
+          project.pack.mods.length ? `种子模组：${project.pack.mods.map((mod) => mod.id).join(', ')}` : '种子模组：（无）',
+          ...notes,
+          '',
+          '下一步：mc_mods 加模组 → mc_design 写内容 → mc_export 导出 → mc_build 构建。',
+        ]
+        return { tool: 'mc_project', action: 'create', dir, file: projectFile, entry, template, text: lines.join('\n') }
+      }
+
+      if (args.action === 'register') {
+        const dirArg = args.dir ?? args.path
+        if (!dirArg) throw new Error('register 需要 dir（项目目录）')
+        const dir = isAbsolute(dirArg) ? dirArg : resolvePath(sessionRootPath, dirArg)
+        const projectFilePath = resolvePath(dir, config.projectFile)
+        let project
+        try {
+          project = await readProject(projectFilePath)
+        } catch (error) {
+          throw new Error(`目录里没有可用的工程文件：${error.message}`)
+        }
+        const entry = await registry.register({
+          root: dir,
+          name: args.name ?? project.name,
+          projectFile: config.projectFile,
+          kind: project.kind ?? 'modpack',
+          source: 'registered',
+          activate: args.use === true,
+        })
+        return {
+          tool: 'mc_project',
+          action: 'register',
+          dir,
+          entry,
+          text: `已注册项目：${entry.name}（${entry.id}）\n目录：${dir}${entry.id === (await registry.list()).active ? '\n已设为当前项目。' : ''}`,
+        }
+      }
+
+      if (args.action === 'use') {
+        const active = await registry.setActive(args.project ?? '')
+        return {
+          tool: 'mc_project',
+          action: 'use',
+          active,
+          text: active
+            ? `已切换当前项目：${active}（其他工具不带 project 参数时仍使用会话工作目录）`
+            : '已清除当前项目；工具将使用会话工作目录。',
+        }
+      }
+
+      if (args.action === 'remove') {
+        if (!args.project) throw new Error('remove 需要 project=<id>')
+        const result = await registry.remove(args.project)
+        return {
+          tool: 'mc_project',
+          action: 'remove',
+          ...result,
+          text: result.removed ? `已从注册表移除 ${args.project}（项目文件未删除）` : `注册表里没有 ${args.project}`,
+        }
+      }
 
       if (args.action === 'init') {
         let project
@@ -927,12 +1094,13 @@ export function apply(ctx, rawConfig) {
         refs: { type: 'array', items: { type: 'string' }, description: '模组引用列表：slug、slug@versionId、projectId' },
         versionId: { type: 'string', description: 'pin 使用的版本 id（也可直接写 refs 里的 slug@versionId）' },
         path: { type: 'string', description: '工程文件路径，默认 project.json' },
+        project: { type: 'string', description: '注册表项目 id（mc_project action=list 查看）；省略则使用当前会话工作目录' },
       },
       required: ['action'],
       additionalProperties: false,
     },
     async execute(args, exec) {
-      const { file } = await projectFileFor(exec, args.path)
+      const { file } = await projectFileFor(exec, args.path, args.project)
       const project = await readProject(file)
       const action = args.action
       const refs = Array.isArray(args.refs) ? args.refs.filter(Boolean) : []
@@ -1018,12 +1186,13 @@ export function apply(ctx, rawConfig) {
         replace: { type: 'boolean', description: 'write 时整体替换而非合并，默认 false' },
         designRoot: { type: 'string', description: '设计目录路径覆盖，默认读工程文件的 design.root' },
         path: { type: 'string', description: '工程文件路径，默认 project.json' },
+        project: { type: 'string', description: '注册表项目 id；省略则使用当前会话工作目录' },
       },
       required: ['action'],
       additionalProperties: false,
     },
     async execute(args, exec) {
-      const { root, file, designRoot: defaultDesignRoot } = await projectPaths(exec, args.path)
+      const { root, file, designRoot: defaultDesignRoot } = await projectPaths(exec, args.path, args.project)
       const designRoot = args.designRoot ? outPath(root, args.designRoot) : defaultDesignRoot
       const action = args.action
 
@@ -1132,12 +1301,13 @@ export function apply(ctx, rawConfig) {
         language: { type: 'string', description: '语言目录（zh_cn/en_us），默认 zh_cn' },
         designRoot: { type: 'string', description: '设计目录路径覆盖' },
         path: { type: 'string', description: '工程文件路径，默认 project.json' },
+        project: { type: 'string', description: '注册表项目 id；省略则使用当前会话工作目录' },
       },
       required: ['target'],
       additionalProperties: false,
     },
     async execute(args, exec) {
-      const { root, file, designRoot: defaultDesignRoot } = await projectPaths(exec, args.path)
+      const { root, file, designRoot: defaultDesignRoot } = await projectPaths(exec, args.path, args.project)
       const designRoot = args.designRoot ? outPath(root, args.designRoot) : defaultDesignRoot
       let project
       try {
@@ -1193,11 +1363,12 @@ export function apply(ctx, rawConfig) {
         versionId: { type: 'string', description: '覆盖工程里的包版本标识' },
         output: { type: 'string', description: '输出 .mrpack 路径；默认 builds/<name>-<versionId>.mrpack' },
         includeOptional: { type: 'boolean', description: '是否打包 optional 依赖，默认 false' },
+        project: { type: 'string', description: '注册表项目 id；省略则使用当前会话工作目录' },
       },
       additionalProperties: false,
     },
     async execute(args, exec) {
-      const { root, file } = await projectFileFor(exec, args.path)
+      const { root, file } = await projectFileFor(exec, args.path, args.project)
       const result = await buildFromProject(
         config,
         {

@@ -18,6 +18,14 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const API = '/craft-workshop/api'
 
+    /** Selected registry project ('' = the session workspace). Persisted per browser. */
+    let activeProjectId = ''
+    const PROJECT_KEY = 'craft-workshop-project'
+    function withProject(path) {
+      const separator = path.includes('?') ? '&' : '?'
+      return path + separator + 'project=' + encodeURIComponent(activeProjectId)
+    }
+
     const KIND_LABELS = {
       character: '人物',
       faction: '势力',
@@ -48,7 +56,7 @@ window.__ModuleLoader__.load({
       recipe: { name: '新配方', type: 'shaped', pattern: [], key: {}, output: '', count: 1 },
     }
 
-    async function api(path, options) {
+    async function request(path, options) {
       const init = { method: options && options.method ? options.method : 'GET', cache: 'no-store' }
       if (options && options.body !== undefined) {
         init.headers = { 'Content-Type': 'application/json' }
@@ -59,6 +67,8 @@ window.__ModuleLoader__.load({
       if (!response.ok || data.ok === false) throw new Error(data.error || 'HTTP ' + response.status)
       return data
     }
+    const api = (path, options) => request(withProject(path), options)
+    const apiRaw = (path, options) => request(path, options)
 
     function formatBytes(bytes) {
       const value = Number(bytes)
@@ -986,11 +996,177 @@ window.__ModuleLoader__.load({
       )
     }
 
+    function useProjects(reloadKey) {
+      const [data, setData] = React.useState({ phase: 'loading', projects: [], active: '', workspaceRoot: '', registryFile: '' })
+      React.useEffect(() => {
+        let cancelled = false
+        apiRaw('/projects')
+          .then((result) => {
+            if (!cancelled) setData(Object.assign({ phase: 'ready' }, result))
+          })
+          .catch((error) => {
+            if (!cancelled) setData({ phase: 'error', error: error.message, projects: [], active: '', workspaceRoot: '' })
+          })
+        return () => {
+          cancelled = true
+        }
+      }, [reloadKey])
+      return data
+    }
+
+    function ProjectBar(props) {
+      const { projects, active, workspaceRoot, registryFile, phase } = props
+      const [busy, setBusy] = React.useState('')
+      const [message, setMessage] = React.useState(null)
+
+      async function act(name, runner) {
+        setBusy(name)
+        setMessage(null)
+        try {
+          const text = await runner()
+          setMessage({ tone: 'success', text })
+          props.onChanged()
+        } catch (error) {
+          setMessage({ tone: 'error', text: error.message })
+        } finally {
+          setBusy('')
+        }
+      }
+
+      async function registerWorkspace() {
+        const dir = workspaceRoot
+        if (!dir) throw new Error('还没有确定工作目录')
+        const result = await apiRaw('/projects', { method: 'POST', body: { action: 'register', dir } })
+        props.onSelect(result.entry.id)
+        return '已注册当前工作区：' + result.entry.name + '（' + result.entry.id + '）'
+      }
+
+      async function removeSelected() {
+        const entry = projects.find((item) => item.id === props.selected)
+        if (!entry) return '当前是工作区模式，没有可移除的注册项目'
+        if (!window.confirm('从注册表移除「' + entry.name + '」？（不会删除任何文件）')) return '已取消'
+        await apiRaw('/projects', { method: 'POST', body: { action: 'remove', project: entry.id } })
+        props.onSelect('')
+        return '已从注册表移除 ' + entry.id
+      }
+
+      return h(
+        'div',
+        { className: 'cw-projbar' },
+        h('span', { className: 'cw-projbar-label' }, '项目'),
+        h(
+          'select',
+          {
+            className: 'cw-select',
+            value: props.selected,
+            onChange: (event) => props.onSelect(event.target.value),
+            'aria-label': '选择项目',
+          },
+          [h('option', { key: '', value: '' }, '当前工作区' + (workspaceRoot ? '（' + workspaceRoot + '）' : ''))].concat(
+            projects.map((entry) =>
+              h('option', { key: entry.id, value: entry.id }, entry.name + ' · ' + entry.id + (entry.exists === false ? '（工程文件缺失）' : '')),
+            ),
+          ),
+        ),
+        h(Button, { onClick: () => props.onCreate(), primary: props.showCreate }, props.showCreate ? '收起新建' : '新建项目'),
+        h(Button, { busy: busy === 'register', onClick: () => act('register', registerWorkspace) }, '注册当前工作区'),
+        props.selected ? h(Button, { danger: true, busy: busy === 'remove', onClick: () => act('remove', removeSelected) }, '移出注册表') : null,
+        phase === 'error' ? h(Badge, { tone: 'warn' }, '项目列表读取失败') : null,
+        h('span', { className: 'cw-projbar-hint', title: registryFile }, registryFile ? '注册表：' + registryFile : ''),
+        message ? h(Note, { tone: message.tone }, message.text) : null,
+      )
+    }
+
+    function NewProjectForm(props) {
+      const [name, setName] = React.useState('')
+      const [dir, setDir] = React.useState('')
+      const [minecraft, setMinecraft] = React.useState('1.21.1')
+      const [loader, setLoader] = React.useState('neoforge')
+      const [template, setTemplate] = React.useState('modpack')
+      const [mods, setMods] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const [message, setMessage] = React.useState(null)
+
+      async function create() {
+        setBusy(true)
+        setMessage(null)
+        try {
+          const result = await apiRaw('/projects', {
+            method: 'POST',
+            body: {
+              action: 'create',
+              name,
+              dir: dir || undefined,
+              minecraft,
+              loader,
+              template,
+              mods: mods.split(/[,\s]+/).filter(Boolean),
+            },
+          })
+          setMessage({ tone: 'success', text: '已创建：' + result.entry.name + ' → ' + result.dir })
+          props.onCreated(result.entry.id)
+        } catch (error) {
+          setMessage({ tone: 'error', text: error.message })
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      return h(
+        Card,
+        { title: '新建项目', extra: h(Badge, null, '在指定目录生成 project.json + design/ + overrides/ + builds/') },
+        h(
+          'div',
+          { className: 'cw-form-grid' },
+          h('label', { className: 'cw-field' }, h('span', null, '名称 *'), h(Input, { value: name, onChange: setName, placeholder: '例如 我的整合包' })),
+          h('label', { className: 'cw-field' }, h('span', null, '目录（留空 = 工作区/<名称>' ), h(Input, { value: dir, onChange: setDir, placeholder: '/abs/path 或 相对目录' })),
+          h('label', { className: 'cw-field' }, h('span', null, 'Minecraft'), h(Input, { value: minecraft, onChange: setMinecraft, placeholder: '1.21.1' })),
+          h('label', { className: 'cw-field' }, h('span', null, '加载器'), h(Input, { value: loader, onChange: setLoader, placeholder: 'neoforge / fabric / forge / paper' })),
+          h('label', { className: 'cw-field' }, h('span', null, '模板'), h(Input, { value: template, onChange: setTemplate, placeholder: 'modpack / server / empty' })),
+          h('label', { className: 'cw-field' }, h('span', null, '种子模组（逗号分隔）'), h(Input, { value: mods, onChange: setMods, placeholder: 'create, jei, curios' })),
+        ),
+        h(
+          'div',
+          { className: 'cw-actions' },
+          h(Button, { primary: true, busy, disabled: !name.trim(), onClick: create }, '创建项目'),
+        ),
+        message ? h(Note, { tone: message.tone }, message.text) : null,
+      )
+    }
+
     function WorkshopPanel() {
       const [tab, setTab] = React.useState('overview')
+      const [projectId, setProjectId] = React.useState(() => {
+        try {
+          return window.localStorage.getItem(PROJECT_KEY) || ''
+        } catch {
+          return ''
+        }
+      })
+      const [reloadKey, setReloadKey] = React.useState(0)
+      const [showCreate, setShowCreate] = React.useState(false)
+      activeProjectId = projectId
+
+      const projects = useProjects(reloadKey)
       const [state, refresh] = useProjectState()
+      React.useEffect(() => {
+        refresh()
+      }, [projectId, reloadKey])
+
+      function selectProject(id) {
+        const next = id || ''
+        setProjectId(next)
+        try {
+          window.localStorage.setItem(PROJECT_KEY, next)
+        } catch {
+          /* ignore storage failures */
+        }
+        setReloadKey((value) => value + 1)
+      }
+
       const data = state.data
       const project = data && data.project
+      const target = data && data.target
 
       const content =
         tab === 'overview'
@@ -1020,16 +1196,38 @@ window.__ModuleLoader__.load({
               { className: 'cw-sub' },
               project
                 ? project.name + ' · Minecraft ' + project.target.minecraft + ' / ' + project.target.loader + (project.target.loaderVersion ? ' ' + project.target.loaderVersion : '')
-                : '整合包创作工具',
+                : '通用整合包创作工具',
             ),
           ),
           h(
             'div',
             { className: 'cw-headctl' },
+            !projectId ? h(Badge, null, '工作区模式') : null,
             project ? h(Badge, { tone: 'brand' }, 'v' + project.versionId) : null,
             h(Button, { onClick: refresh, busy: state.phase === 'refreshing' }, '刷新'),
           ),
         ),
+        h(ProjectBar, {
+          projects: projects.projects || [],
+          active: projects.active,
+          workspaceRoot: projects.workspaceRoot,
+          registryFile: projects.registryFile,
+          phase: projects.phase,
+          selected: projectId,
+          showCreate,
+          onCreate: () => setShowCreate((value) => !value),
+          onSelect: selectProject,
+          onChanged: () => setReloadKey((value) => value + 1),
+        }),
+        showCreate
+          ? h(NewProjectForm, {
+              onCreated: (id) => {
+                setShowCreate(false)
+                selectProject(id)
+                setReloadKey((value) => value + 1)
+              },
+            })
+          : null,
         h(
           'nav',
           { className: 'cw-tabs', role: 'tablist' },
@@ -1048,7 +1246,7 @@ window.__ModuleLoader__.load({
             ),
           ),
         ),
-        h('div', { className: 'cw-body' }, content),
+        h('div', { className: 'cw-body', key: projectId + ':' + reloadKey }, content),
       )
     }
 
@@ -1133,6 +1331,13 @@ window.__ModuleLoader__.load({
       '.cw-pre{margin:8px 0 0;padding:10px;border-radius:8px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);font-family:var(--ds-font-family-code,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:11px;line-height:17px;white-space:pre-wrap;max-height:200px;overflow:auto}',
       '.cw-navicon{color:var(--dsw-alias-label-secondary);display:block}',
       '.cw-navicon-on{color:var(--dsw-alias-brand-primary)}',
+      '.cw-projbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:12px clamp(20px,4vw,44px) 0}',
+      '.cw-projbar-label{font-size:12px;color:var(--dsw-alias-label-secondary);flex:none}',
+      '.cw-projbar-hint{font-size:11px;color:var(--dsw-alias-state-idle-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px}',
+      '.cw-select{box-sizing:border-box;height:30px;min-width:180px;max-width:340px;padding:0 8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px}',
+      '.cw-form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}',
+      '.cw-field{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dsw-alias-label-secondary);min-width:0}',
+      '.cw-field .cw-input{flex:none;width:100%}',
       '@container cw (width<=760px){.cw-split{grid-template-columns:minmax(0,1fr)}.cw-textarea{min-height:240px}}',
     ].join('\n')
 

@@ -1,9 +1,0 @@
-{
-  "id": "location-sample",
-  "name": "示例地点",
-  "region": "",
-  "type": "城镇",
-  "coordinates": "维度: minecraft:overworld / X:0 Y:64 Z:0",
-  "description": "地点简介",
-  "body": "地点与地图设计正文（Markdown）。"
-}

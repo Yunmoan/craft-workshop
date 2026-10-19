@@ -56,7 +56,7 @@ import {
 export const inject = ['tools']
 
 const DEFAULTS = {
-  userAgent: 'craft-workshop/0.5.0 (https://ipthmc.zyghit.cn)',
+  userAgent: 'craft-workshop/0.6.0 (https://ipthmc.zyghit.cn)',
   defaultGameVersion: '1.21.1',
   defaultLoader: 'neoforge',
   defaultOutputRoot: '',

@@ -3,15 +3,15 @@ node_modules/
 .DS_Store
 *.log
 
-# 生成的整合包与导出（可由工具重建）
-build/
-builds/
-build/exports/
+# 本地项目数据（本仓库是插件包，不包含任何具体整合包工程）
+/project.json
+/design/
+/overrides/
+/builds/
+/build/
+/server/
+/proxy/
 .craft-workshop/
-
-# 服务端/代理运行目录（含 eula、forwarding.secret 等本机凭据）
-server/
-proxy/
 
 # 本机凭据
 .gitkeys/

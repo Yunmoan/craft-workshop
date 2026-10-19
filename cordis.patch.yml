@@ -1,10 +1,10 @@
-# CraftWorkshop（方块工坊）— IPTHMC 社团的 Minecraft 运营工具。
-# Edit the config values below; they are passed verbatim to the plugin's apply().
+# CraftWorkshop（方块工坊）— 通用 MC 整合包创作插件。
+# 单包同时提供 Host 工具与 Web 主面板；下面的 config 会原样传给 apply()。
 - insert:
     - id: craft-workshop
       name: '@ipthmc/craft-workshop'
       config:
-        userAgent: 'craft-workshop/0.5.0 (https://ipthmc.zyghit.cn)'
+        userAgent: 'craft-workshop/0.6.0 (https://ipthmc.zyghit.cn)'
         defaultGameVersion: '1.21.1'
         defaultLoader: neoforge
         defaultOutputRoot: ''
@@ -15,3 +15,4 @@
         projectFile: project.json
         designRoot: design
         defaultNamespace: ipthmc
+        registryFile: ''

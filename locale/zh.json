@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "方块工坊",
+    "description": "DSH 通用整合包创作插件：多项目管理、Modrinth 查询、剧情/任务/人物等设计内容编辑、FTB Quests/Patchouli/KubeJS 导出、.mrpack 构建、服务端配置与探活，并自带 Web 主面板。"
+  }
+}

@@ -12,7 +12,7 @@
  * of Harness Client packages.
  */
 window.__ModuleLoader__.load({
-  id: '@ipthmc/craft-workshop-ui',
+  id: '@ipthmc/craft-workshop',
   factory(require) {
     const React = require('react')
     const h = React.createElement

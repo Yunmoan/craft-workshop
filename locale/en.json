@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "CraftWorkshop",
+    "description": "A general-purpose DSH plugin for Minecraft modpack authoring: multi-project registry, Modrinth queries, story/quest/character design editing, FTB Quests / Patchouli / KubeJS export, .mrpack builds, server configs and status pings — with a built-in Web panel."
+  }
+}

@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "方块工坊",
-    "description": "方块工坊 · IPTHMC 社团的 MC 运营工具：查询 Modrinth 资源、解析模组依赖、生成 .mrpack 整合包、生成 NeoForge/Fabric/Paper/Velocity/Arclight 服务端配置，并探测服务器在线状态。"
-  }
-}

@@ -1,50 +1,83 @@
 # 推送到 GitHub（public）
 
-目标仓库：**`Yunmoan/craft-workshop`**（公开）。
-本地已经 `git init` 并提交（分支 `main`），remote 已指向 `git@github.com:Yunmoan/craft-workshop.git`。
+目标仓库：**`Yunmoan/craft-workshop`** ｜ 本地分支：`main`（已有 4 个提交）
+remote 已配置好两条（`git remote -v` 可查）：
 
-## 需要你做的登录/授权步骤（当前尚未推送）
+- `origin` → `https://github.com/Yunmoan/craft-workshop.git`（**git 原生登录**，推荐）
+- `ssh-origin` → `git@github.com:Yunmoan/craft-workshop.git`（备用，需先加 SSH 公钥）
 
-### 方式 A：SSH 部署密钥（推荐，本仓库已生成）
+---
 
-1. 浏览器登录 GitHub（账号 `Yunmoan`）。
-2. 新建公开仓库：<https://github.com/new> → 名称 `craft-workshop` → **Public** → **不要**勾选 README / .gitignore / license（保持空仓库）。
-3. 打开 <https://github.com/settings/keys> → **New SSH key** → Title 填 `IPTHMC CraftWorkshop`，Key 粘贴：
+## 方式 A：在 git 里直接登录（HTTPS + Token，推荐）
+
+1. 先在浏览器建**空的 public 仓库**（不要勾 README）：<https://github.com/new> → 名称 `craft-workshop`
+2. 生成 Token（二选一）：
+   - Classic：<https://github.com/settings/tokens> → Generate new token (classic) → 勾 **`public_repo`**
+   - Fine-grained：<https://github.com/settings/personal-access-tokens> → 选该仓库 → **Contents: Read and write**
+3. 在终端执行：
+
+   ```bash
+   cd ~/ipthmc
+   git push -u origin main
+   ```
+
+   git 会提示：
+
+   ```
+   Username for 'https://github.com': Yunmoan
+   Password for 'https://Yunmoan@github.com': <粘贴 Token，不是账号密码>
+   ```
+
+   成功后 macOS 钥匙串（`credential.helper=osxkeychain`）会记住凭据，之后再 `git push` 不再询问。
+
+> 想提前把凭据写进钥匙串（这样 Agent 也能直接推送）：
+>
+> ```bash
+> printf 'protocol=https\nhost=github.com\nusername=Yunmoan\npassword=<你的TOKEN>\n\n' | git credential-osxkeychain store
+> ```
+
+## 方式 B：SSH 部署密钥（无需每次输入）
+
+1. 建空仓库（同上）。
+2. 打开 <https://github.com/settings/keys> → New SSH key → Authentication，粘贴：
 
    ```
    ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAxmbQDPtzBzhFtckjuAlw5YjWuH6iKmUbePUMofQPWP ipthmc@craftworkshop
    ```
 
-4. 回到工作区执行：
+3. 执行：
 
    ```bash
-   ./scripts/push-github.sh
+   cd ~/ipthmc
+   ./scripts/push-github.sh        # 使用 .gitkeys/ipthmc_deploy 私钥推送到 ssh-origin
    ```
 
-   成功后会输出 `main -> main`，之后可以用 `git push` 直接推。
+## 方式 C：让 Agent 代推
 
-> 私钥在 `.gitkeys/ipthmc_deploy`，已被 `.gitignore` 排除，不会进仓库。
-> 如果希望改用 HTTPS + Personal Access Token：`git remote set-url origin https://github.com/Yunmoan/craft-workshop.git`，然后按 GitHub 提示登录。
+把 Token 写入 `.gitkeys/github_token`（一行纯 Token，已被 `.gitignore` 排除），告诉 Agent「token 已写入」即可；Agent 会用它完成 `git push`，随后删除该文件。
 
-### 方式 B：让 Agent 代为推送（需要 PAT）
-
-1. 生成 classic PAT（勾选 `public_repo` 即可）：<https://github.com/settings/tokens>。
-2. 保存到 `/Users/liminghan/ipthmc/.gitkeys/github_token`（一行纯 token）。
-3. 告诉 Agent「已写入 token」，Agent 会用 GitHub API 建仓并推送，完成后删除 token 文件。
+---
 
 ## 仓库里有什么 / 没有什么
 
-**包含**：`craft-workshop/`（Host 插件）、`craft-workshop-ui/`（Web UI）、`project.json`、`design/`（模板）、`docs/`（创作手册、部署手册、调研资料）、`README.md`、推送脚本。
+**包含**：`craft-workshop/`（Host 插件）、`craft-workshop-ui/`（Web UI 插件）、`project.json`、`design/`（模板）、`docs/`、`README.md`、推送脚本。
 
-**排除（`.gitignore`）**：
-- `server/`、`proxy/`：服务端/代理运行目录，含 `eula.txt`、**`forwarding.secret`** 等本机凭据；
-- `builds/`、`build/`：可随时用工具重建的产物；
-- `.gitkeys/`：SSH 私钥；
-- `node_modules/`、`.DS_Store`、日志。
+**排除（`.gitignore`）**：`server/`、`proxy/`（含 `forwarding.secret`）、`build/`、`builds/`、`.craft-workshop/`（操作历史）、`.gitkeys/`（SSH 私钥）、`node_modules/`。
+
+## 克隆后如何安装插件
+
+`install_bundle` 的 target 必须是**包目录**，不是仓库根：
+
+```
+plugin_manager install_bundle  target=/path/to/craft-workshop
+plugin_manager install_bundle  target=/path/to/craft-workshop-ui
+```
+
+注意：`craft-workshop-ui` 的 `dsh.client` 声明必须在安装/扫描时就存在（Host 侧包元数据在重启前有缓存），所以 UI 单独成包；若以后合并成一个包，需要重启 Harness 才会被重新扫描。
 
 ## 提交身份
 
-当前本地提交作者为 `IPTHMC <ipthmc@users.noreply.github.com>`（占位）。如需改成你的 GitHub 身份：
+当前本地提交作者为 `IPTHMC <ipthmc@users.noreply.github.com>`（占位）。如需改成你的身份：
 
 ```bash
 git config user.name  "你的名字"
@@ -52,7 +85,7 @@ git config user.email "你的邮箱"
 git commit --amend --reset-author --no-edit
 ```
 
-## 可选后续
+## 可选
 
-- 添加 LICENSE（目前未添加，公开仓库默认保留所有权利）。如要开源建议 MIT/Apache-2.0。
-- 发布插件时可以把 `craft-workshop/` 单独拆成 npm/GitHub 仓库；当前先作为单仓库维护。
+- LICENSE：目前未添加（公开仓库默认保留所有权利）；要开源建议 MIT/Apache-2.0。
+- 插件发布：可把 `craft-workshop/`、`craft-workshop-ui/` 分别拆成独立仓库或发到 npm。

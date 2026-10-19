@@ -23,9 +23,15 @@
 
 ## 当前状态（2026-10-18）
 
+**通用工具（多项目管理）**
+- ✅ 项目注册表（`~/.craft-workshop/projects.json`）：`mc_project action=create/register/list/use/remove`，可管理任意多个整合包项目。
+- ✅ **一键建项目**：模板 `modpack` / `server` / `empty`，可带种子模组、目标版本与加载器，可选 `git init`；自动生成 `project.json` + `design/` + `overrides/` + `builds/`。
+- ✅ 其他创作工具（`mc_mods` / `mc_design` / `mc_export` / `mc_build`）支持 `project=<id>` 指定项目；不带参数时仍作用于当前会话工作目录。
+
 **Web UI 管理器（侧栏「方块工坊」→ 主面板）**
 - ✅ **一级主面板页面**（`main` 面板 key=`craft-workshop`）+ **左侧栏图标**（`sidebar.panellist`），与 Plugins / Schedules 同级，不再藏在设置弹窗里。
 - ✅ 页面内分五个分页：**概览 / 模组 / 设计 / 构建 / 服务器**；概览含工程摘要、四格统计、快捷操作（导出全部、构建）与操作历史。
+- ✅ 顶部**项目栏**：项目下拉切换、新建项目表单、注册当前工作区、移出注册表（选择持久化在浏览器）。
 - ✅ 模组页支持添加/移除/解锁 + 依赖解析；设计页为「列表 + JSON 编辑器 + 全量校验」；构建页四种导出与构建；服务器页一致性检查/同步安装/备份/配置生成/状态探测。
 - ✅ 全部操作走 Host 的**本机管理接口** `/craft-workshop/api/*`（写操作限制 loopback），与 Agent 的 `mc_*` 工具共用同一套管理器实现。
 

@@ -836,6 +836,7 @@ export function apply(ctx, rawConfig) {
         path: { type: 'string', description: '工程文件路径，默认 project.json' },
         project: { type: 'string', description: '注册表项目 id（use/remove/list 时的目标，其他动作也可用它指定项目）' },
         dir: { type: 'string', description: 'create/register 的目标目录（绝对路径或相对会话目录）' },
+        id: { type: 'string', description: 'create/register 时显式指定项目 id（小写字母/数字/-/_/.)，省略则用目录名' },
         template: { type: 'string', enum: ['modpack', 'server', 'empty'], description: 'create 的模板：modpack（默认，含设计目录）/ server / empty' },
         mods: { type: 'array', items: { type: 'string' }, description: 'create 时的种子模组列表（slug 或 slug@versionId）' },
         git: { type: 'boolean', description: 'create 时是否执行 git init（默认 false）' },
@@ -919,6 +920,7 @@ export function apply(ctx, rawConfig) {
         const entry = await registry.register({
           root: dir,
           name: project.name,
+          id: args.id,
           projectFile: config.projectFile,
           kind: project.kind,
           source: 'created',
@@ -950,6 +952,7 @@ export function apply(ctx, rawConfig) {
         const entry = await registry.register({
           root: dir,
           name: args.name ?? project.name,
+          id: args.id,
           projectFile: config.projectFile,
           kind: project.kind ?? 'modpack',
           source: 'registered',

@@ -8,21 +8,28 @@
  * active, which is what the Web UI opens by default and what tools use when a call names
  * a project explicitly (`project: "<id>"`).
  */
+import { createHash } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 export const REGISTRY_VERSION = 1
 
+export const PROJECT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,47}$/
+
+/**
+ * Project ids stay ASCII (URLs, CLI args, file names); a name without ASCII letters
+ * falls back to a short content hash so ids remain stable and readable-ish.
+ */
 export function slugifyProject(text) {
-  return (
-    String(text ?? '')
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 64) || 'project'
-  )
+  const ascii = String(text ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48)
+  if (ascii) return ascii
+  return `project-${createHash('sha1').update(String(text ?? '')).digest('hex').slice(0, 6)}`
 }
 
 export function defaultRegistryPath(config = {}) {
@@ -115,7 +122,7 @@ export function createProjectRegistry(config = {}) {
       return data.active
     },
     /** Register (or update) a project directory; returns the stored entry. */
-    async register({ root, name, projectFile = 'project.json', kind = 'modpack', source = 'registered', activate = false }) {
+    async register({ root, name, id, projectFile = 'project.json', kind = 'modpack', source = 'registered', activate = false }) {
       if (!root || !isAbsolute(root)) throw new Error('注册项目需要绝对路径 root')
       const data = await load()
       const absolute = resolve(root)
@@ -126,12 +133,17 @@ export function createProjectRegistry(config = {}) {
         entry.kind = kind || entry.kind
         entry.source = source
       } else {
-        let id = slugifyProject(name || absolute.split('/').filter(Boolean).pop() || 'project')
+        // Prefer the directory name for the id (usually ASCII), then an explicit id, then the display name.
+        const dirName = absolute.split('/').filter(Boolean).pop() || 'project'
+        const base = PROJECT_ID_PATTERN.test(String(id ?? ''))
+          ? String(id)
+          : slugifyProject(dirName) || slugifyProject(name)
+        let candidate = base
         let suffix = 2
-        while (data.projects.some((item) => item.id === id)) id = `${slugifyProject(name || 'project')}-${suffix++}`
+        while (data.projects.some((item) => item.id === candidate)) candidate = `${base}-${suffix++}`
         entry = {
-          id,
-          name: name || absolute.split('/').filter(Boolean).pop() || id,
+          id: candidate,
+          name: name || dirName || candidate,
           root: absolute,
           projectFile,
           kind,

@@ -27,7 +27,24 @@ build/
 builds/                 # 构建出的 .mrpack（输出）
 ```
 
-## 2. 设计内容数据模型
+## 2. 多项目与创建项目
+
+一个工作区可以管多个项目，注册表默认在 `~/.craft-workshop/projects.json`：
+
+```text
+mc_project action=create  name=我的整合包 template=modpack mods=["create","jei"] id=my-pack
+mc_project action=register dir=/path/to/existing id=legacy
+mc_project action=list
+mc_project action=use     project=my-pack        # 切换当前项目
+mc_project action=remove  project=my-pack        # 只移出注册表，不删文件
+```
+
+- 模板：`modpack`（含 design/ 骨架）、`server`（含 servers.mod 指向 `server/`）、`empty`（只建 project.json）。
+- 创建后目录结构：`project.json`、`design/`、`overrides/`、`builds/`。
+- 其他工具用 `project=<id>` 指定项目；不指定时使用当前会话工作目录。
+- Web UI 顶部项目栏等价于上面几条命令。
+
+## 3. 设计内容数据模型
 
 所有设计条目都是 JSON：`design/<kind>/<id>.json`。用 `mc_design action=describe kind=<kind>` 可查看某类的字段说明和示例。
 
@@ -44,7 +61,7 @@ builds/                 # 构建出的 .mrpack（输出）
 
 交叉引用会被 `mc_design action=check` 校验：人物→势力、剧情→人物/势力/地点/任务章节、任务依赖、物品→配方、配方→物品。
 
-## 3. 标准创作循环
+## 4. 标准创作循环
 
 ```text
 mc_project  action=init                 # 首次：建工程 + design/ 骨架
@@ -59,7 +76,7 @@ mc_build                                # 从工程构建 .mrpack
 
 日常改内容只动 `design/` 与 `project.json`，然后重复 `check → export → build`。
 
-## 4. 导出物与游戏内实装
+## 5. 导出物与游戏内实装
 
 ### FTB Quests（已实现）
 
@@ -90,7 +107,7 @@ mc_build                                # 从工程构建 .mrpack
 - 物品注册在启动时执行一次：**新增/修改物品后必须重启游戏**；配方可用 `/reload`。
 - 核心机制脚本仍建议手写在 `overrides/kubejs/`。
 
-## 5. DSH 管理器（侧栏「方块工坊」主面板）
+## 6. DSH 管理器（侧栏「方块工坊」主面板）
 
 管理与创作有两种等价入口，底层是同一套管理器。Web 入口是**左侧栏图标打开的一级主面板页面**（不是设置弹窗），页面内分五个分页：
 
@@ -104,7 +121,7 @@ mc_build                                # 从工程构建 .mrpack
 
 Agent 侧的 `mc_project` / `mc_mods` / `mc_design` / `mc_export` / `mc_build` / `mc_pack_install` / `mc_pack_check` / `mc_server_config` / `mc_status` 与页面对应；两边都改同一份工程与设计源文件。操作历史记录在 `.craft-workshop/history.json`。
 
-## 6. 设计文档导出
+## 7. 设计文档导出
 
 `mc_export target=design-wiki` 会把设计内容渲染成 Markdown（`build/exports/design-wiki/`），适合：
 
@@ -112,14 +129,14 @@ Agent 侧的 `mc_project` / `mc_mods` / `mc_design` / `mc_export` / `mc_build` /
 - 提交到仓库做版本 diff；
 - 作为剧情与任务的"审稿稿"。
 
-## 7. 与服务器部署的衔接
+## 8. 与服务器部署的衔接
 
 1. `mc_build` 生成 `.mrpack`；
 2. `mc_pack_install pack=... serverDir=server/neoforge` 同步服务端 mods 并校验 sha1；
 3. `mc_pack_check` 复核一致性；
 4. `mc_server_config` 维护服务端配置（NeoForge/Paper/Velocity/Arclight 模板）。
 
-## 8. 约定与注意事项
+## 9. 约定与注意事项
 
 - `design/<kind>/<id>.json` 的 `id` 只允许字母/数字/汉字/点/下划线/中划线，且必须等于文件名。
 - 设计 id 用于稳定派生 FTB Quests 的 16hex ID：**改 id 会导致任务进度不兼容**（发布后不要随意改）。

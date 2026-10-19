@@ -43,6 +43,21 @@ IPTHMC 社团的 **Minecraft 整合包创作工具**（DSH Host 插件）。它�
 | `mc_pack_check` | 服务端目录 vs 整合包一致性校验 |
 | `mc_status` | Java SLP 服务器探活（MOTD 组件展开 + `_minecraft._tcp` SRV） |
 
+## 通用项目（多项目注册表）
+
+工具不再绑定某一个工作区：项目记录在注册表里（默认 `~/.craft-workshop/projects.json`，可用 config `registryFile` 改），可以新建、注册、切换、移出任意多个项目。
+
+| 动作 | 说明 |
+|---|---|
+| `mc_project action=create` | 新建项目：`name`（必填）、`dir`（默认 `工作区/<id>`）、`template`（`modpack` / `server` / `empty`）、`minecraft` / `loader` / `loaderVersion`、`mods`（种子模组）、`git`（可选 `git init`）、`id`（显式项目 id）、`use`（默认切换为当前项目） |
+| `mc_project action=register` | 把已有目录（含 `project.json`）纳入注册表，`id` 省略时用目录名 |
+| `mc_project action=list` | 列出项目、检测工程文件是否缺失、显示当前激活项目 |
+| `mc_project action=use` | 切换激活项目（`project=<id>`；留空 = 清除） |
+| `mc_project action=remove` | 仅从注册表移除，**不会删除任何文件** |
+
+- **项目 id 规则**：ASCII 小写（`a-z0-9._-`，≤48 字符）；未显式给 `id` 时优先取目录名，其次名称；名称无 ASCII 字符时回落为 `project-<hash>`。
+- **其他创作工具支持 `project` 参数**：`mc_mods` / `mc_design` / `mc_export` / `mc_build` 都可用 `project=<id>` 指定项目；不带该参数时仍使用当前会话工作目录（避免误操作别的项目）。
+
 ## 管理器 API（Web UI 用）
 
 Host 半在 `webServer` 上注册了一套**仅限本机**的管理器接口（POST 会校验来源地址必须是本机），供 Web UI 使用；Agent 也可以直接调试：

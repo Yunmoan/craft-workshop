@@ -1,7 +1,7 @@
 # 方块工坊 CraftWorkshop
 
-> **DeepSeek Harness 插件** ｜ 包名 `@ipthmc/craft-workshop` ｜ 版本 `0.6.0`
-> 单包同时提供 **Host 工具**（14 个 `mc_*`）与 **Web 主面板**（侧栏图标 + 5 个分页）。
+> **DeepSeek Harness 插件** ｜ 包名 `@ipthmc/craft-workshop` ｜ 版本 `0.7.0`
+> 单包同时提供 **Host 工具**（17 个 `mc_*`）与 **Web 主面板**（侧栏图标 + 8 个分页）。
 > 由 IPTHMC 社团维护，用于 Minecraft 整合包创作与服务器运营。
 
 ---
@@ -29,7 +29,7 @@ design/（剧情·任务·人物·势力·地点·世界观·物品·配方）  
 plugin_manager  action=install_bundle  target=<本仓库绝对路径>
 ```
 
-- 单包、单 Loader 行（`craft-workshop`），安装后同时得到 14 个模型工具与 Web 面板。
+- 单包、单 Loader 行（`craft-workshop`），安装后同时得到 17 个模型工具与 Web 面板。
 - 面板入口：**左侧栏方块图标 → 主面板「方块工坊」**。
 - 卸载：`plugin_manager action=remove_bundle target=@ipthmc/craft-workshop`。
 
@@ -50,7 +50,7 @@ plugin_manager  action=install_bundle  target=<本仓库绝对路径>
 
 ---
 
-## 工具总览（14 个）
+## 工具总览（17 个）
 
 **工程与创作**
 
@@ -61,6 +61,14 @@ plugin_manager  action=install_bundle  target=<本仓库绝对路径>
 | `mc_design` | 8 类设计内容：`list` / `get` / `write` / `delete` / `check` / `describe` |
 | `mc_export` | 导出 `design-wiki` / `ftbquests` / `patchouli` / `kubejs` / `all` |
 | `mc_build` | 从工程构建 `.mrpack`（含 overrides 与内容映射） |
+
+**市场 / AI 组合 / 客户端**
+
+| 工具 | 作用 |
+|---|---|
+| `mc_market` | 模组/插件市场：`categories` 分类、`search` 检索（分类/加载器/版本/端侧）、`install-mods` 加入工程、`install-plugins` 下载到服务端 `plugins/`、`installed` 已装清单 |
+| `mc_compose` | AI 组合整合包：`roles` 角色预设、`plan` 按角色/主题生成候选方案并做依赖校验、`apply` 应用到工程 |
+| `mc_client` | 个性化客户端：`show` / `set`（内存·JVM·分辨率·画质·语言·按键）、`add-mods` / `remove-mods` 客户端专属模组、`export` 生成 `options.txt` 与启动器配置 |
 
 **资源查询**
 
@@ -107,12 +115,53 @@ mc_project action=remove project=my-pack     # 只移出注册表，不删文件
 
 - **项目栏**：项目下拉（当前工作区 + 已注册项目）、新建项目表单、注册当前工作区、移出注册表；选择持久化在浏览器。
 - **概览**：工程摘要、四格统计、导出状态、最近构建、操作历史、一键导出/构建。
+- **市场**：分类货架 + 关键词搜索 + 端侧过滤，一键「加入工程」或「装到服务端 plugins/」。
+- **组合**：选角色 + 填主题 → 生成候选方案 → 勾选后应用（或应用整份方案）。
 - **模组**：清单（版本 / 双端支持 / 锁定状态）+ 添加 / 移除 / 解锁 / 重新解析。
 - **设计**：8 类内容列表 + JSON 编辑器 + 新建 / 保存 / 删除 / 全量校验。
+- **客户端**：内存 / 分辨率 / 视距 / 画质 / 帧率 / GUI 缩放 / 语言表单，客户端专属模组，导出 `options.txt` 与启动器参数。
 - **构建**：四种导出、构建整合包、产物列表、操作日志。
 - **服务器**：一致性检查、同步安装、备份、生成配置、状态探测、备份列表。
 
 ---
+
+## 模组 / 插件市场
+
+```text
+mc_market action=categories
+mc_market action=search category=rpg query=魔法 side=server
+mc_market action=install-mods refs=["create","jei"]        # 加入工程（自动解析依赖）
+mc_market action=install-plugins refs=["luckperms"]        # 下载到服务端 plugins/
+mc_market action=installed
+```
+
+货架分类：性能优化 / 客户端体验 / 幻想 RPG / 科技机械 / 建筑装饰 / 农业食物 / 世界生成 / 生物与敌人 / 前置库 / 服务端插件 / 代理插件。装载入工程后与 `mc_mods` 完全等价（同一份 `project.json`）。
+
+## AI 组合整合包
+
+```text
+mc_compose action=roles
+mc_compose action=plan roles=["library","performance","rpg","world","mobs","quest"] theme="幻想 魔法 冒险" perRole=3
+mc_compose action=apply plan=<方案 id>          # 或 apply refs=["waystones","..."] 自行取舍
+```
+
+- 按目标版本 + 加载器检索，自动过滤已在工程里的项目，方案落盘到 `build/exports/compose/`。
+- 每个角色先按单关键词检索，命中不足时回退到 Modrinth 分类热门；中文主题只作为方案元数据（全文检索需英文关键词）。
+- `plan` 会自动跑一次依赖闭包校验，把冲突/缺失直接列出来。
+- Agent 负责主题与取舍，工具负责检索、去重、校验与落库。
+
+## 个性化客户端
+
+```text
+mc_client action=show
+mc_client action=set patch={"memory":{"min":"6G","max":"10G"},"graphics":{"renderDistance":12,"maxFps":144},"resolution":{"width":2560,"height":1440}}
+mc_client action=add-mods refs=["sodium","iris"]     # 客户端专属，构建时标 client-only
+mc_client action=export                              # options.txt + 启动器参数
+```
+
+- `options.txt` 导出到 `build/exports/client/`，经内容映射进入 `.mrpack` 的 `overrides/options.txt`，首次启动即生效。
+- JVM 参数与说明写到 `build/client/jvm-args.txt`、`client-profile.md`（launcher 侧设置，不随包分发）。
+- 客户端专属模组在构建时写入 `.mrpack` 且 `env.server = unsupported`，不会被服务端安装。
 
 ## 管理器 API（Web 面板使用，仅本机）
 
@@ -125,6 +174,9 @@ mc_project action=remove project=my-pack     # 只移出注册表，不删文件
 | POST | `/craft-workshop/api/export` | 导出指定目标 |
 | POST / GET | `/craft-workshop/api/build` `…/builds` | 构建整合包 / 产物列表 |
 | GET/POST | `/craft-workshop/api/server` | `status` / `install` / `check` / `backup` / `generate` |
+| GET/POST | `/craft-workshop/api/market` | 市场检索 / `install-mods` / `install-plugins` |
+| GET/POST | `/craft-workshop/api/compose` | 角色清单 / `plan` / `apply` |
+| GET/POST | `/craft-workshop/api/client` | 客户端配置读取 / `set` / `add-mods` / `remove-mods` / `export` |
 | GET | `/craft-workshop/api/backups` `…/history` | 备份列表 / 操作历史 |
 
 所有接口都可带 `?project=<id>` 指定项目（空值 = 强制当前工作区）；写操作仅接受本机（loopback）请求。Agent 的 `mc_*` 工具与这些接口共用同一套管理器实现。
@@ -180,7 +232,7 @@ mc_project action=remove project=my-pack     # 只移出注册表，不删文件
 ├── cordis.patch.yml      # Loader 行与默认 config
 ├── index.js              # Host 半：apply() 注册 14 个工具 + 管理器 API
 ├── client.js             # Web 半：主面板 + 侧栏图标（5 个分页）
-├── src/                  # Host 模块：registry/project/design/exporters/mrpack/…
+├── src/                  # Host 模块：registry/project/design/exporters/mrpack/market/compose/clientprofile/…
 ├── locale/{zh,en}.json   # Plugin Manager 展示元数据
 ├── icon.svg              # 插件图标
 ├── dev/smoke.mjs         # 模块级冒烟测试

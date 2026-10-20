@@ -1,8 +1,8 @@
 {
   "name": "@ipthmc/craft-workshop",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
-  "description": "方块工坊 CraftWorkshop —— DSH 通用整合包创作插件：多项目管理、Modrinth 资源查询、剧情/任务/人物等设计内容编辑、FTB Quests/Patchouli/KubeJS 导出、.mrpack 构建、服务端配置与探活，并自带 Web 主面板。",
+  "description": "方块工坊 CraftWorkshop —— DSH 通用整合包创作插件：多项目管理、模组/插件市场、AI 组合整合包、剧情/任务/人物等设计内容编辑、个性化客户端、FTB Quests/Patchouli/KubeJS 导出、.mrpack 构建与服务端运维，自带 Web 主面板。",
   "type": "module",
   "exports": {
     ".": "./index.js",

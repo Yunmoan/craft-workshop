@@ -40,8 +40,11 @@ window.__ModuleLoader__.load({
     const EXPORT_LABELS = { 'design-wiki': '设计文档', ftbquests: 'FTB Quests', patchouli: 'Patchouli 指南书', kubejs: 'KubeJS' }
     const TABS = [
       ['overview', '概览'],
+      ['market', '市场'],
+      ['compose', '组合'],
       ['mods', '模组'],
       ['design', '设计'],
+      ['client', '客户端'],
       ['build', '构建'],
       ['server', '服务器'],
     ]
@@ -1134,6 +1137,402 @@ window.__ModuleLoader__.load({
       )
     }
 
+    function MarketTab() {
+      const [categories, setCategories] = React.useState([])
+      const [category, setCategory] = React.useState('')
+      const [query, setQuery] = React.useState('')
+      const [submitted, setSubmitted] = React.useState('')
+      const [side, setSide] = React.useState('')
+      const [data, setData] = React.useState({ phase: 'loading', hits: [] })
+      const [busy, setBusy] = React.useState('')
+      const [message, setMessage] = React.useState(null)
+
+      React.useEffect(() => {
+        let cancelled = false
+        setData((previous) => ({ phase: previous.hits.length ? 'refreshing' : 'loading', hits: previous.hits }))
+        const params = ['limit=12']
+        if (category) params.push('category=' + encodeURIComponent(category))
+        if (submitted) params.push('query=' + encodeURIComponent(submitted))
+        if (side) params.push('side=' + side)
+        api('/market?' + params.join('&'))
+          .then((result) => {
+            if (cancelled) return
+            setData({ phase: 'ready', hits: result.hits || [], totalHits: result.totalHits })
+            if (result.categories) setCategories(result.categories)
+          })
+          .catch((error) => {
+            if (!cancelled) setData({ phase: 'error', error: error.message, hits: [] })
+          })
+        return () => {
+          cancelled = true
+        }
+      }, [category, side, submitted])
+
+      async function act(name, runner) {
+        setBusy(name)
+        setMessage(null)
+        try {
+          const text = await runner()
+          setMessage({ tone: 'success', text })
+        } catch (error) {
+          setMessage({ tone: 'error', text: error.message })
+        } finally {
+          setBusy('')
+        }
+      }
+
+      const installMod = (hit) =>
+        act('mod:' + hit.slug, async () => {
+          const result = await api('/market', { method: 'POST', body: { action: 'install-mods', refs: [hit.slug] } })
+          return '已加入工程：' + (result.added.join(', ') || '（无变化）') + '，当前 ' + result.mods.length + ' 个模组'
+        })
+      const installPlugin = (hit) =>
+        act('plugin:' + hit.slug, async () => {
+          const result = await api('/market', { method: 'POST', body: { action: 'install-plugins', refs: [hit.slug] } })
+          return '已装到服务端 plugins/：' + (result.installed.map((item) => item.filename).join(', ') || '（无）')
+        })
+
+      const rows = (data.hits || []).map((hit) => {
+        const isPlugin = (hit.projectType || '').includes('plugin')
+        return h(
+          'tr',
+          { key: hit.slug },
+          h('td', { className: 'cw-mono' }, hit.slug),
+          h('td', null, hit.title),
+          h('td', { className: 'cw-table-hint' }, hit.downloads),
+          h('td', null, (hit.clientSide || '?') + ' / ' + (hit.serverSide || '?')),
+          h(
+            'td',
+            { className: 'cw-table-actions' },
+            isPlugin
+              ? h(Button, { busy: busy === 'plugin:' + hit.slug, onClick: () => installPlugin(hit) }, '装到服务端')
+              : h(Button, { primary: true, busy: busy === 'mod:' + hit.slug, onClick: () => installMod(hit) }, '加入工程'),
+          ),
+        )
+      })
+
+      return h(
+        'div',
+        { className: 'cw-stack cw-stack-wide' },
+        h(
+          Card,
+          { title: '模组 / 插件市场', extra: h(Badge, null, data.totalHits !== undefined ? '命中 ' + data.totalHits : '') },
+          h(
+            'div',
+            { className: 'cw-form-row' },
+            h(Input, { value: query, onChange: setQuery, placeholder: '搜索关键词，例如 create / 魔法 / minimap' }),
+            h(Button, { primary: true, onClick: () => setSubmitted(query.trim()) }, '搜索'),
+            h(
+              'select',
+              { className: 'cw-select', value: side, onChange: (event) => setSide(event.target.value), 'aria-label': '端侧过滤' },
+              [h('option', { key: '', value: '' }, '双端不限'), h('option', { key: 'client', value: 'client' }, '客户端可用'), h('option', { key: 'server', value: 'server' }, '服务端可用')],
+            ),
+          ),
+          h(
+            'div',
+            { className: 'cw-kind-row' },
+            h('button', { type: 'button', className: 'cw-kind ' + (category === '' ? 'cw-kind-active' : ''), onClick: () => setCategory('') }, '全部分类'),
+            categories.map((item) =>
+              h('button', { key: item.id, type: 'button', className: 'cw-kind ' + (category === item.id ? 'cw-kind-active' : ''), onClick: () => setCategory(item.id) }, item.label),
+            ),
+          ),
+          message ? h(Note, { tone: message.tone }, message.text) : null,
+        ),
+        h(
+          Card,
+          { title: '结果' },
+          data.phase === 'loading'
+            ? h(Note, null, '正在检索 Modrinth…')
+            : data.phase === 'error'
+              ? h(Note, { tone: 'error' }, data.error)
+              : rows.length
+                ? h(
+                    'table',
+                    { className: 'cw-table cw-table-wide' },
+                    h('thead', null, h('tr', null, ['slug', '名称', '下载', '客户端 / 服务端', ''].map((text) => h('th', { key: text }, text)))),
+                    h('tbody', null, rows),
+                  )
+                : h(Note, null, '没有结果，换个关键词或分类试试。'),
+        ),
+      )
+    }
+
+    function ComposeTab() {
+      const [roles, setRoles] = React.useState([])
+      const [chosen, setChosen] = React.useState(['library', 'performance', 'rpg'])
+      const [theme, setTheme] = React.useState('')
+      const [perRole, setPerRole] = React.useState('3')
+      const [plan, setPlan] = React.useState(null)
+      const [picked, setPicked] = React.useState([])
+      const [busy, setBusy] = React.useState('')
+      const [message, setMessage] = React.useState(null)
+
+      React.useEffect(() => {
+        let cancelled = false
+        api('/compose')
+          .then((result) => {
+            if (!cancelled) setRoles(result.roles || [])
+          })
+          .catch(() => {
+            /* roles are optional for the first render */
+          })
+        return () => {
+          cancelled = true
+        }
+      }, [])
+
+      function toggleRole(id) {
+        setChosen((list) => (list.includes(id) ? list.filter((item) => item !== id) : list.concat(id)))
+      }
+
+      function togglePick(slug) {
+        setPicked((list) => (list.includes(slug) ? list.filter((item) => item !== slug) : list.concat(slug)))
+      }
+
+      async function act(name, runner) {
+        setBusy(name)
+        setMessage(null)
+        try {
+          const text = await runner()
+          setMessage({ tone: 'success', text })
+        } catch (error) {
+          setMessage({ tone: 'error', text: error.message })
+        } finally {
+          setBusy('')
+        }
+      }
+
+      async function generate() {
+        setBusy('plan')
+        setMessage(null)
+        try {
+          const result = await api('/compose', { method: 'POST', body: { action: 'plan', roles: chosen, perRole: Number(perRole) || 3, theme } })
+          setPlan(result.plan)
+          setPicked((result.plan.entries || []).map((entry) => entry.slug))
+          setMessage({ tone: 'success', text: '已生成方案 ' + result.plan.id + '：' + result.plan.entries.length + ' 项候选' + (result.path ? '（已落盘）' : '') })
+        } catch (error) {
+          setMessage({ tone: 'error', text: error.message })
+        } finally {
+          setBusy('')
+        }
+      }
+
+      const entries = (plan && plan.entries) || []
+      return h(
+        'div',
+        { className: 'cw-stack cw-stack-wide' },
+        h(
+          Card,
+          { title: 'AI 组合整合包', extra: h(Badge, null, 'Agent 出主题，工具做检索与校验') },
+          h(
+            'div',
+            { className: 'cw-kind-row' },
+            roles.map((role) =>
+              h(
+                'button',
+                {
+                  key: role.id,
+                  type: 'button',
+                  className: 'cw-kind ' + (chosen.includes(role.id) ? 'cw-kind-active' : ''),
+                  onClick: () => toggleRole(role.id),
+                  title: role.keywords,
+                },
+                role.label,
+              ),
+            ),
+          ),
+          h(
+            'div',
+            { className: 'cw-form-row' },
+            h(Input, { value: theme, onChange: setTheme, placeholder: '主题关键词，例如「幻想 中世纪 魔法 冒险」' }),
+            h(Input, { value: perRole, onChange: setPerRole, placeholder: '每类数量' }),
+            h(Button, { primary: true, busy: busy === 'plan', onClick: generate }, '生成方案'),
+          ),
+          message ? h(Note, { tone: message.tone }, message.text) : null,
+        ),
+        plan
+          ? h(
+              Card,
+              {
+                title: '方案 ' + plan.id,
+                extra: [
+                  h(Badge, { key: 'n' }, '已选 ' + picked.length + '/' + entries.length),
+                  h(Button, { key: 'apply', primary: true, busy: busy === 'apply', onClick: () => act('apply', async () => {
+                    const result = await api('/compose', { method: 'POST', body: { action: 'apply', refs: picked } })
+                    return '已应用 ' + result.added.length + ' 项，工程现有 ' + result.mods.length + ' 个模组'
+                  }) }, '应用所选'),
+                  h(Button, { key: 'all', busy: busy === 'all', onClick: () => act('all', async () => {
+                    const result = await api('/compose', { method: 'POST', body: { action: 'apply', plan: plan.id } })
+                    return '已应用整份方案，共 ' + result.added.length + ' 项'
+                  }) }, '应用全部'),
+                ],
+              },
+              h(
+                'table',
+                { className: 'cw-table cw-table-wide' },
+                h('thead', null, h('tr', null, ['', '角色', 'slug', '名称', '客户端 / 服务端'].map((text) => h('th', { key: text }, text)))),
+                h(
+                  'tbody',
+                  null,
+                  entries.map((entry) =>
+                    h(
+                      'tr',
+                      { key: entry.slug },
+                      h('td', null, h('input', { type: 'checkbox', checked: picked.includes(entry.slug), onChange: () => togglePick(entry.slug), 'aria-label': '选择 ' + entry.slug })),
+                      h('td', null, entry.roleLabel || entry.role),
+                      h('td', { className: 'cw-mono' }, entry.slug),
+                      h('td', null, entry.title),
+                      h('td', null, (entry.clientSide || '?') + ' / ' + (entry.serverSide || '?')),
+                    ),
+                  ),
+                ),
+              ),
+            )
+          : h(Card, { title: '还没有方案' }, h(Note, null, '选几个角色 + 主题，点「生成方案」：工具会按目标版本/加载器检索、过滤已在工程里的项目，并给出依赖校验。')),
+      )
+    }
+
+    function ClientTab() {
+      const [data, setData] = React.useState({ phase: 'loading' })
+      const [draft, setDraft] = React.useState(null)
+      const [modInput, setModInput] = React.useState('')
+      const [busy, setBusy] = React.useState('')
+      const [message, setMessage] = React.useState(null)
+
+      React.useEffect(() => {
+        let cancelled = false
+        api('/client')
+          .then((result) => {
+            if (cancelled) return
+            setData({ phase: 'ready', profile: result.profile })
+            setDraft({
+              memoryMax: result.profile.memory.max,
+              memoryMin: result.profile.memory.min,
+              width: result.profile.resolution.width,
+              height: result.profile.resolution.height,
+              renderDistance: result.profile.graphics.renderDistance,
+              graphicsMode: result.profile.graphics.graphicsMode,
+              maxFps: result.profile.graphics.maxFps,
+              vsync: result.profile.graphics.vsync,
+              guiScale: result.profile.graphics.guiScale,
+              language: result.profile.language,
+            })
+          })
+          .catch((error) => {
+            if (!cancelled) setData({ phase: 'error', error: error.message })
+          })
+        return () => {
+          cancelled = true
+        }
+      }, [])
+
+      function field(key, value) {
+        setDraft((current) => Object.assign({}, current, { [key]: value }))
+      }
+
+      async function act(name, runner) {
+        setBusy(name)
+        setMessage(null)
+        try {
+          const text = await runner()
+          setMessage({ tone: 'success', text })
+        } catch (error) {
+          setMessage({ tone: 'error', text: error.message })
+        } finally {
+          setBusy('')
+        }
+      }
+
+      if (data.phase === 'loading') return h(Note, null, '正在读取客户端配置…')
+      if (data.phase === 'error') return h(Card, { title: '读取失败' }, h(Note, { tone: 'error' }, data.error))
+      const profile = data.profile
+
+      const save = () =>
+        act('save', async () => {
+          const patch = {
+            memory: { min: draft.memoryMin, max: draft.memoryMax },
+            resolution: { width: Number(draft.width) || 1920, height: Number(draft.height) || 1080 },
+            graphics: {
+              renderDistance: Number(draft.renderDistance) || 12,
+              graphicsMode: draft.graphicsMode,
+              maxFps: Number(draft.maxFps) || 120,
+              vsync: Boolean(draft.vsync),
+              guiScale: Number(draft.guiScale) || 3,
+            },
+            language: draft.language,
+          }
+          await api('/client', { method: 'POST', body: { action: 'set', patch } })
+          return '客户端配置已保存'
+        })
+
+      return h(
+        'div',
+        { className: 'cw-stack' },
+        h(
+          Card,
+          { title: '个性化客户端', extra: h(Badge, null, '写入工程 project.json · client') },
+          h(
+            'div',
+            { className: 'cw-form-grid' },
+            h('label', { className: 'cw-field' }, h('span', null, '最小内存'), h(Input, { value: draft.memoryMin, onChange: (value) => field('memoryMin', value) })),
+            h('label', { className: 'cw-field' }, h('span', null, '最大内存'), h(Input, { value: draft.memoryMax, onChange: (value) => field('memoryMax', value) })),
+            h('label', { className: 'cw-field' }, h('span', null, '分辨率宽'), h(Input, { value: draft.width, onChange: (value) => field('width', value) })),
+            h('label', { className: 'cw-field' }, h('span', null, '分辨率高'), h(Input, { value: draft.height, onChange: (value) => field('height', value) })),
+            h('label', { className: 'cw-field' }, h('span', null, '视距'), h(Input, { value: draft.renderDistance, onChange: (value) => field('renderDistance', value) })),
+            h('label', { className: 'cw-field' }, h('span', null, '画质模式'), h(Input, { value: draft.graphicsMode, onChange: (value) => field('graphicsMode', value), placeholder: 'fancy / fast / fabulous' })),
+            h('label', { className: 'cw-field' }, h('span', null, '最高帧'), h(Input, { value: draft.maxFps, onChange: (value) => field('maxFps', value) })),
+            h('label', { className: 'cw-field' }, h('span', null, 'GUI 缩放'), h(Input, { value: draft.guiScale, onChange: (value) => field('guiScale', value) })),
+            h('label', { className: 'cw-field' }, h('span', null, '语言'), h(Input, { value: draft.language, onChange: (value) => field('language', value), placeholder: 'zh_cn' })),
+          ),
+          h(
+            'div',
+            { className: 'cw-actions' },
+            h(Button, { primary: true, busy: busy === 'save', onClick: save }, '保存'),
+            h(Button, { busy: busy === 'export', onClick: () => act('export', async () => {
+              const result = await api('/client', { method: 'POST', body: { action: 'export' } })
+              return '已导出 options.txt（' + result.optionCount + ' 条）与启动器配置'
+            }) }, '导出客户端配置'),
+          ),
+          message ? h(Note, { tone: message.tone }, message.text) : null,
+        ),
+        h(
+          Card,
+          { title: '客户端专属模组（' + profile.mods.length + '）', extra: h(Badge, null, '构建时标记 client-only') },
+          h(
+            'div',
+            { className: 'cw-form-row' },
+            h(Input, { value: modInput, onChange: setModInput, placeholder: 'Modrinth slug，例如 sodium / iris' }),
+            h(Button, { primary: true, busy: busy === 'add', onClick: () => act('add', async () => {
+              const result = await api('/client', { method: 'POST', body: { action: 'add-mods', refs: [modInput.trim()] } })
+              setModInput('')
+              setData({ phase: 'ready', profile: Object.assign({}, profile, { mods: result.mods }) })
+              return '已加入客户端模组：' + modInput.trim()
+            }) }, '加入'),
+          ),
+          profile.mods.length
+            ? h(
+                'table',
+                { className: 'cw-table' },
+                h('tbody', null, profile.mods.map((slug) =>
+                  h('tr', { key: slug }, h('td', { className: 'cw-mono' }, slug), h('td', { className: 'cw-table-actions' },
+                    h(Button, { danger: true, onClick: () => act('rm:' + slug, async () => {
+                      const result = await api('/client', { method: 'POST', body: { action: 'remove-mods', refs: [slug] } })
+                      setData({ phase: 'ready', profile: Object.assign({}, profile, { mods: result.mods }) })
+                      return '已移除 ' + slug
+                    }) }, '移除'))),
+                )),
+              )
+            : h(Note, null, '还没有客户端专属模组（例如 Sodium / Iris / 小地图）。'),
+        ),
+        h(
+          Card,
+          { title: '启动器参数', extra: h(Badge, null, 'JVM 参数不会进包，需粘到启动器') },
+          h('pre', { className: 'cw-pre' }, '-Xms' + profile.memory.min + ' -Xmx' + profile.memory.max + ' ' + profile.jvmArgs.slice(0, 6).join(' ') + ' …'),
+          h(Note, null, '导出后完整参数在 build/client/jvm-args.txt 与 client-profile.md。'),
+        ),
+      )
+    }
+
     function WorkshopPanel() {
       const [tab, setTab] = React.useState('overview')
       const [projectId, setProjectId] = React.useState(() => {
@@ -1168,16 +1567,17 @@ window.__ModuleLoader__.load({
       const project = data && data.project
       const target = data && data.target
 
-      const content =
-        tab === 'overview'
-          ? h(OverviewTab)
-          : tab === 'mods'
-            ? h(ModsTab)
-            : tab === 'design'
-              ? h(DesignTab)
-              : tab === 'build'
-                ? h(BuildTab)
-                : h(ServerTab)
+      const TAB_COMPONENTS = {
+        overview: OverviewTab,
+        market: MarketTab,
+        compose: ComposeTab,
+        mods: ModsTab,
+        design: DesignTab,
+        client: ClientTab,
+        build: BuildTab,
+        server: ServerTab,
+      }
+      const content = h(TAB_COMPONENTS[tab] ?? OverviewTab)
 
       return h(
         'div',

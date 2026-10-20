@@ -45,13 +45,17 @@ export async function searchProjects(config, opts, signal) {
     projectType = 'mod',
     loaders = [],
     gameVersions = [],
+    categories = [],
     limit = 10,
     offset = 0,
     index = 'relevance',
   } = opts
   const facets = []
   if (projectType) facets.push([`project_type:${projectType}`])
-  if (loaders.length) facets.push(loaders.map((loader) => `categories:${loader}`))
+  // Loader and content categories share the Modrinth `categories` facet; a group is OR,
+  // groups are AND, so each list becomes its own group.
+  const categoryValues = [...loaders, ...categories]
+  if (categoryValues.length) facets.push(categoryValues.map((value) => `categories:${value}`))
   if (gameVersions.length) facets.push(gameVersions.map((version) => `versions:${version}`))
   const url = buildUrl(MODRINTH_API, '/search', {
     query,

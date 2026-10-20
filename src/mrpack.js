@@ -80,6 +80,7 @@ export async function buildMrpack(config, opts, signal) {
     serverOverridesDir,
     includeOptional = false,
     extraFiles = [],
+    clientOnlyProjects = [],
   } = opts
 
   const { entries, warnings } = await resolvePlan(
@@ -92,31 +93,49 @@ export async function buildMrpack(config, opts, signal) {
   const files = []
   const skipped = []
   const usedPaths = new Set()
-  for (const entry of entries) {
+
+  function addFile(entry, forcedEnv) {
     if (entry.projectType !== 'mod') {
       skipped.push(`${entry.title}（${entry.projectType}）不是 mod；.mrpack 的 files[] 只能放 mods/ 下的文件，请改用 overrides 手动放置`)
-      continue
+      return
     }
     if (!entry.url || !entry.filename) {
       warnings.push(`${entry.title} 的版本没有可下载文件，已跳过`)
-      continue
+      return
     }
     let path = `mods/${entry.filename}`
     if (usedPaths.has(path)) {
       path = `mods/${entry.slug}-${entry.filename}`
       if (usedPaths.has(path)) {
         warnings.push(`${entry.title} 与其他项目文件名冲突，已跳过 ${entry.filename}`)
-        continue
+        return
       }
     }
     usedPaths.add(path)
     files.push({
       path,
       hashes: { sha1: entry.sha1, sha512: entry.sha512 },
-      env: { client: envValue(entry.clientSide), server: envValue(entry.serverSide) },
+      env: forcedEnv ?? { client: envValue(entry.clientSide), server: envValue(entry.serverSide) },
       downloads: [entry.url],
       fileSize: entry.size,
     })
+  }
+
+  for (const entry of entries) addFile(entry)
+
+  // Client-only mods (personalized client): always client, never the server.
+  if (clientOnlyProjects.length) {
+    const known = new Set(entries.map((entry) => entry.projectId))
+    try {
+      const extra = await resolvePlan(config, { refs: clientOnlyProjects, gameVersion, loader, includeOptional: false }, signal)
+      for (const entry of extra.entries) {
+        if (known.has(entry.projectId)) continue
+        known.add(entry.projectId)
+        addFile(entry, { client: 'required', server: 'unsupported' })
+      }
+    } catch (error) {
+      warnings.push(`客户端专属模组解析失败：${error.message}`)
+    }
   }
 
   const resolvedLoaderVersion = await resolveLoaderVersion(config, loader, gameVersion, loaderVersion)

@@ -136,7 +136,15 @@ Agent 侧的 `mc_project` / `mc_mods` / `mc_design` / `mc_export` / `mc_build` /
 3. `mc_pack_check` 复核一致性；
 4. `mc_server_config` 维护服务端配置（NeoForge/Paper/Velocity/Arclight 模板）。
 
-## 9. 约定与注意事项
+## 9. 市场 / AI 组合 / 个性化客户端
+
+**市场**：`mc_market` 用分类货架或关键词搜索 Modrinth，`install-mods` 直接并入工程模组清单（与 `mc_mods` 同源），`install-plugins` 把插件 jar 下载到服务端 `plugins/` 并记入 `servers.mod.plugins`。
+
+**AI 组合**：`mc_compose` 按角色（前置库/性能/世界/RPG/生物/任务…）检索候选，自动跳过工程里已有的项目，方案写到 `build/exports/compose/<plan>.json`；`plan` 阶段会跑依赖闭包校验，`apply` 时可用整份方案或自行给 `refs` 取舍。中文主题只作元数据，检索用角色英文关键词。
+
+**个性化客户端**：`mc_client` 的配置存在 `project.json` 的 `client` 段；`export` 生成 `build/exports/client/options.txt`（随包进 `overrides/options.txt`）以及 `build/client/jvm-args.txt`、`client-profile.md`（启动器侧）。`client.mods` 里的模组在构建时标记 `env.server = unsupported`，只进客户端。
+
+## 10. 约定与注意事项
 
 - `design/<kind>/<id>.json` 的 `id` 只允许字母/数字/汉字/点/下划线/中划线，且必须等于文件名。
 - 设计 id 用于稳定派生 FTB Quests 的 16hex ID：**改 id 会导致任务进度不兼容**（发布后不要随意改）。

@@ -289,6 +289,7 @@ export async function buildFromProject(config, opts, signal) {
       serverOverridesDir: overrides.serverOverrides ? resolve(opts.projectRoot, overrides.serverOverrides) : undefined,
       includeOptional: opts.includeOptional ?? false,
       extraFiles,
+      clientOnlyProjects: project.client?.mods ?? [],
     },
     signal,
   )

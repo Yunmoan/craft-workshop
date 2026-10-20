@@ -45,6 +45,9 @@ import { pingServer, resolveMinecraftSrv } from './ping.js'
 import { generateServerConfig } from './servercfg.js'
 import { createZip } from './zip.js'
 import { createProjectRegistry, slugifyProject } from './registry.js'
+import { installServerPlugins, marketCategories, marketSearch } from './market.js'
+import { applyComposition, composePlan, composeRoles, readComposePlan } from './compose.js'
+import { clientProfile, exportClientProfile, updateClientProfile } from './clientprofile.js'
 
 const EXPORT_TARGETS = ['design-wiki', 'ftbquests', 'patchouli', 'kubejs']
 const HISTORY_FILE = '.craft-workshop/history.json'
@@ -621,6 +624,128 @@ export function registerWebUi(ctx, config, helpers) {
     },
   }
 
+  const marketManager = {
+    async search(params, target) {
+      const project = await readProject(target.file).catch(() => undefined)
+      const loaders = params.loaders?.length ? params.loaders : project ? [project.target.loader] : [config.defaultLoader]
+      const gameVersions = params.gameVersions?.length ? params.gameVersions : project ? [project.target.minecraft] : [config.defaultGameVersion]
+      const result = await marketSearch(config, {
+        category: params.category,
+        query: params.query ?? '',
+        projectType: params.type,
+        loaders,
+        gameVersions,
+        side: params.side,
+        sortBy: params.sort,
+        limit: Number(params.limit) || 12,
+      }, AbortSignal.timeout(60000))
+      return { ...result, categories: marketCategories(), loaders, gameVersions }
+    },
+    async install(target, body) {
+      const project = await readProject(target.file)
+      const refs = (body.refs ?? []).filter(Boolean)
+      if (!refs.length) throw new Error('缺少 refs')
+      if (body.action === 'install-plugins') {
+        const serverDir = resolvePath(target.root, project.servers?.mod?.dir ?? 'server/neoforge')
+        const result = await installServerPlugins(config, {
+          refs,
+          serverDir,
+          gameVersion: project.target.minecraft,
+          loaders: body.loaders?.length ? body.loaders : ['paper'],
+          overwrite: Boolean(body.overwrite),
+        }, AbortSignal.timeout(180000))
+        project.servers = project.servers ?? {}
+        project.servers.mod = project.servers.mod ?? { kind: project.target.loader, dir: 'server/neoforge' }
+        const list = new Set(project.servers.mod.plugins ?? [])
+        for (const item of result.installed) list.add(item.ref)
+        project.servers.mod.plugins = [...list]
+        await writeProject(target.file, project)
+        await recordHistory({ action: 'market-install-plugins', ok: result.failed.length === 0, detail: refs.join(', ') })
+        return result
+      }
+      const added = addMods(project, refs)
+      await writeProject(target.file, project)
+      await recordHistory({ action: 'market-install-mods', ok: true, detail: refs.join(', ') })
+      return { added: added.map((mod) => mod.id), mods: project.pack.mods }
+    },
+  }
+
+  const composeManager = {
+    roles() {
+      return { roles: composeRoles() }
+    },
+    async plan(target, body) {
+      const project = await readProject(target.file)
+      const planDir = resolvePath(target.root, 'build/exports/compose')
+      const { plan, path } = await composePlan(config, {
+        project,
+        roles: body.roles?.length ? body.roles : composeRoles().map((role) => role.id),
+        perRole: body.perRole,
+        theme: body.theme ?? '',
+        avoid: body.avoid ?? [],
+        must: body.must ?? [],
+        planDir,
+      }, AbortSignal.timeout(180000))
+      await recordHistory({ action: 'compose-plan', ok: true, detail: `${plan.id} · ${plan.entries.length} 项` })
+      return { plan, path }
+    },
+    async apply(target, body) {
+      const project = await readProject(target.file)
+      const planDir = resolvePath(target.root, 'build/exports/compose')
+      let plan
+      let refs = body.refs ?? []
+      if (body.plan) {
+        const loaded = await readComposePlan(planDir, body.plan)
+        plan = loaded.plan
+        refs = plan.entries.map((entry) => entry.slug)
+      }
+      if (!refs.length) throw new Error('需要 plan 或 refs')
+      const { added } = applyComposition(project, { plan, refs })
+      await writeProject(target.file, project)
+      await recordHistory({ action: 'compose-apply', ok: true, detail: `${added.length} 项` })
+      return { added: added.map((mod) => mod.id), mods: project.pack.mods, plan: plan?.id ?? '' }
+    },
+  }
+
+  const clientManager = {
+    async show(target) {
+      const project = await readProject(target.file)
+      return { profile: clientProfile(project), raw: project.client ?? {} }
+    },
+    async set(target, patch) {
+      const project = await readProject(target.file)
+      const profile = updateClientProfile(project, patch)
+      await writeProject(target.file, project)
+      return { profile }
+    },
+    async mods(target, action, refs) {
+      const project = await readProject(target.file)
+      const profile = clientProfile(project)
+      const set = new Set(profile.mods)
+      for (const ref of refs ?? []) {
+        if (action === 'add-mods') set.add(ref)
+        else set.delete(ref)
+      }
+      updateClientProfile(project, { mods: [...set] })
+      await writeProject(target.file, project)
+      return { mods: [...set] }
+    },
+    async export(target) {
+      const project = await readProject(target.file)
+      const exportDir = resolvePath(target.root, 'build/exports/client')
+      const launcherDir = resolvePath(target.root, 'build/client')
+      const result = await exportClientProfile(project, { exportDir, launcherDir })
+      const content = project.pack.content ?? []
+      if (!content.some((mapping) => mapping.from === 'build/exports/client')) {
+        content.push({ from: 'build/exports/client', to: '', zone: 'overrides', optional: true })
+        project.pack.content = content
+        await writeProject(target.file, project)
+      }
+      await recordHistory({ action: 'client-export', ok: true, detail: exportDir })
+      return { exportDir, launcherDir, optionCount: result.optionCount }
+    },
+  }
+
   // -------------------------------------------------------------------------
   // Route dispatch
   // -------------------------------------------------------------------------
@@ -688,6 +813,46 @@ export function registerWebUi(ctx, config, helpers) {
       }
       if (method === 'POST' && path === '/build') return sendJson(res, 200, { ok: true, ...(await buildManager.run(body)) })
       if (method === 'GET' && path === '/builds') return sendJson(res, 200, { ok: true, builds: await buildManager.list() })
+      if (method === 'GET' && path === '/market') {
+        return sendJson(res, 200, {
+          ok: true,
+          ...(await marketManager.search(
+            {
+              category: url.searchParams.get('category') ?? undefined,
+              query: url.searchParams.get('query') ?? '',
+              type: url.searchParams.get('type') ?? undefined,
+              side: url.searchParams.get('side') ?? undefined,
+              sort: url.searchParams.get('sort') ?? undefined,
+              limit: url.searchParams.get('limit') ?? undefined,
+            },
+            requestTarget ?? (await resolveTarget(undefined)),
+          )),
+        })
+      }
+      if (method === 'POST' && path === '/market') {
+        const target = requestTarget ?? (await resolveTarget(undefined))
+        return sendJson(res, 200, { ok: true, ...(await marketManager.install(target, body)) })
+      }
+      if (method === 'GET' && path === '/compose') return sendJson(res, 200, { ok: true, ...composeManager.roles() })
+      if (method === 'POST' && path === '/compose') {
+        const target = requestTarget ?? (await resolveTarget(undefined))
+        if (body.action === 'plan') return sendJson(res, 200, { ok: true, ...(await composeManager.plan(target, body)) })
+        if (body.action === 'apply') return sendJson(res, 200, { ok: true, ...(await composeManager.apply(target, body)) })
+        return sendJson(res, 400, { ok: false, error: `未知的组合操作：${body.action}` })
+      }
+      if (method === 'GET' && path === '/client') {
+        const target = requestTarget ?? (await resolveTarget(undefined))
+        return sendJson(res, 200, { ok: true, ...(await clientManager.show(target)) })
+      }
+      if (method === 'POST' && path === '/client') {
+        const target = requestTarget ?? (await resolveTarget(undefined))
+        if (body.action === 'set') return sendJson(res, 200, { ok: true, ...(await clientManager.set(target, body.patch ?? {})) })
+        if (body.action === 'add-mods' || body.action === 'remove-mods') {
+          return sendJson(res, 200, { ok: true, ...(await clientManager.mods(target, body.action, body.refs ?? [])) })
+        }
+        if (body.action === 'export') return sendJson(res, 200, { ok: true, ...(await clientManager.export(target)) })
+        return sendJson(res, 400, { ok: false, error: `未知的客户端操作：${body.action}` })
+      }
       if (method === 'GET' && path === '/server') return sendJson(res, 200, { ok: true, ...(await serverManager.state()) })
       if (method === 'GET' && path === '/backups') return sendJson(res, 200, { ok: true, backups: await serverManager.backups() })
       if (method === 'POST' && path === '/server') {

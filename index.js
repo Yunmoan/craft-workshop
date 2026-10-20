@@ -40,6 +40,9 @@ import {
 import { exportFtbQuests, exportKubeJs, exportPatchouli } from './src/exporters.js'
 import { registerWebUi } from './src/webui.js'
 import { createProjectRegistry, slugifyProject } from './src/registry.js'
+import { MARKET_CATEGORIES, installServerPlugins, marketCategories, marketSearch } from './src/market.js'
+import { applyComposition, composePlan, composeRoles, readComposePlan, renderPlanTable } from './src/compose.js'
+import { CLIENT_DEFAULTS, clientProfile, exportClientProfile, updateClientProfile } from './src/clientprofile.js'
 import {
   addMods,
   buildFromProject,
@@ -56,7 +59,7 @@ import {
 export const inject = ['tools']
 
 const DEFAULTS = {
-  userAgent: 'craft-workshop/0.6.0 (https://ipthmc.zyghit.cn)',
+  userAgent: 'craft-workshop/0.7.0 (https://ipthmc.zyghit.cn)',
   defaultGameVersion: '1.21.1',
   defaultLoader: 'neoforge',
   defaultOutputRoot: '',
@@ -1404,6 +1407,338 @@ export function apply(ctx, rawConfig) {
     render: (_args, value) => value.text,
   })
 
+  // ---------------------------------------------------------------------------
+  // mc_market — mod/plugin marketplace
+  // ---------------------------------------------------------------------------
+  const marketTool = defineTool({
+    name: 'mc_market',
+    description:
+      '模组/插件市场：search 搜索（分类 / 加载器 / 版本 / 端侧）、categories 分类清单、install-mods 装进工程模组清单、install-plugins 下载服务端插件到 plugins/、installed 查看已装内容。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['search', 'categories', 'install-mods', 'install-plugins', 'installed'], description: '操作类型' },
+        query: { type: 'string', description: '搜索关键词（与分类关键词合并）' },
+        category: { type: 'string', enum: MARKET_CATEGORIES.map((item) => item.id), description: '市场分类' },
+        projectType: { type: 'string', enum: PROJECT_TYPES, description: '资源类型，默认跟随分类（mod / plugin）' },
+        loaders: { type: 'array', items: { type: 'string', enum: LOADER_ENUM }, description: '加载器过滤，默认工程目标加载器' },
+        gameVersions: { type: 'array', items: { type: 'string' }, description: 'Minecraft 版本，默认工程目标版本' },
+        side: { type: 'string', enum: ['client', 'server'], description: '只看客户端可用 / 服务端可用' },
+        sortBy: { type: 'string', enum: SORT_INDEXES, description: '排序，默认下载量' },
+        limit: { type: 'integer', minimum: 1, maximum: 50, description: '返回条数，默认 12' },
+        refs: { type: 'array', items: { type: 'string' }, description: 'install 用的项目引用（slug 或 slug@versionId）' },
+        overwrite: { type: 'boolean', description: 'install-plugins 是否覆盖同名 jar' },
+        project: { type: 'string', description: '注册表项目 id；省略则使用当前会话工作目录' },
+        path: { type: 'string', description: '工程文件路径' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const { root, file } = await projectFileFor(exec, args.path, args.project)
+      const project = await readProject(file).catch(() => undefined)
+      const gameVersions = args.gameVersions?.length ? args.gameVersions : project ? [project.target.minecraft] : [config.defaultGameVersion]
+      const loaders = args.loaders?.length ? args.loaders : project ? [project.target.loader] : [config.defaultLoader]
+
+      if (args.action === 'categories') {
+        const rows = marketCategories().map((item) => [item.id, item.label, item.type, item.loaders.join('/') || '-', item.keywords])
+        return {
+          tool: 'mc_market',
+          action: 'categories',
+          categories: marketCategories(),
+          text: ['市场分类：', '', formatTable(['id', '名称', '类型', '默认加载器', '关键词'], rows), '', '用法：mc_market action=search category=performance'].join('\n'),
+        }
+      }
+
+      if (args.action === 'search') {
+        const result = await marketSearch(config, {
+          category: args.category,
+          query: args.query ?? '',
+          projectType: args.projectType,
+          loaders,
+          gameVersions,
+          side: args.side,
+          sortBy: args.sortBy,
+          limit: args.limit ?? 12,
+        }, exec.signal)
+        const rows = result.hits.map((hit) => [hit.slug, truncate(hit.title, 24), hit.downloads, sideText(hit), formatDate(hit.updated), truncate(hit.description, 40)])
+        const lines = [
+          `市场搜索${args.category ? ` · ${args.category}` : ''}${args.query ? ` · ${args.query}` : ''}｜版本 ${gameVersions.join(',')}｜加载器 ${loaders.join(',')}`,
+          `命中 ${result.totalHits}，显示 ${result.hits.length}`,
+          '',
+          formatTable(['slug', '名称', '下载', '客户端/服务端', '更新', '简介'], rows),
+          '',
+          '安装：mc_market action=install-mods refs=["<slug>"]（或 install-plugins 装到服务端）',
+        ]
+        return { tool: 'mc_market', action: 'search', hits: result.hits, totalHits: result.totalHits, text: lines.join('\n') }
+      }
+
+      if (!project) throw new Error('这一步需要工程文件；先 mc_project action=init 或 create')
+
+      if (args.action === 'install-mods') {
+        const refs = (args.refs ?? []).filter(Boolean)
+        if (!refs.length) throw new Error('install-mods 需要 refs')
+        const added = addMods(project, refs)
+        await writeProject(file, project)
+        const plan = await resolveProject(config, project, exec.signal)
+        const lines = [
+          `已加入工程：${added.map((mod) => mod.id).join(', ') || '（无变化）'}`,
+          `工程模组数：${project.pack.mods.length}`,
+          `依赖解析：${plan.entries.length} 项${plan.warnings.length ? `，警告 ${plan.warnings.length}` : '，无警告'}`,
+        ]
+        if (plan.warnings.length) lines.push('', ...plan.warnings.map((warning) => `- ${warning}`))
+        return { tool: 'mc_market', action: 'install-mods', added: added.map((mod) => mod.id), plan: { total: plan.entries.length, warnings: plan.warnings }, text: lines.join('\n') }
+      }
+
+      if (args.action === 'install-plugins') {
+        const refs = (args.refs ?? []).filter(Boolean)
+        if (!refs.length) throw new Error('install-plugins 需要 refs')
+        const serverDir = resolvePath(root, project.servers?.mod?.dir ?? 'server/neoforge')
+        const pluginLoaders = args.loaders?.length ? args.loaders : ['paper']
+        const result = await installServerPlugins(config, {
+          refs,
+          serverDir,
+          gameVersion: gameVersions[0],
+          loaders: pluginLoaders,
+          overwrite: args.overwrite ?? false,
+        }, exec.signal)
+        project.servers = project.servers ?? {}
+        project.servers.mod = project.servers.mod ?? { kind: project.target.loader, dir: 'server/neoforge' }
+        const list = new Set(project.servers.mod.plugins ?? [])
+        for (const item of result.installed) list.add(item.ref)
+        project.servers.mod.plugins = [...list]
+        await writeProject(file, project)
+        const lines = [
+          `服务端插件目录：${result.serverDir}`,
+          `已安装 ${result.installed.filter((item) => item.status === 'installed').length}，已存在 ${result.installed.filter((item) => item.status === 'already-present').length}，失败 ${result.failed.length}`,
+          '',
+          ...result.installed.map((item) => `- ${item.ref} → ${item.filename}（${item.status}）`),
+          ...result.failed.map((item) => `- ${item.ref} 失败：${item.reason}`),
+        ]
+        return { tool: 'mc_market', action: 'install-plugins', ...result, text: lines.join('\n') }
+      }
+
+      // installed
+      const serverPlugins = project.servers?.mod?.plugins ?? []
+      const lines = [
+        `工程模组：${project.pack.mods.length} 个`,
+        ...project.pack.mods.map((mod) => `- ${mod.id}${mod.versionId ? `@${mod.versionId}` : ''}`),
+        '',
+        `服务端插件记录：${serverPlugins.length} 个`,
+        ...serverPlugins.map((item) => `- ${item}`),
+      ]
+      return { tool: 'mc_market', action: 'installed', mods: project.pack.mods, serverPlugins, text: lines.join('\n') }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  // ---------------------------------------------------------------------------
+  // mc_compose — AI pack composition (roles -> candidates -> validate -> apply)
+  // ---------------------------------------------------------------------------
+  const composeTool = defineTool({
+    name: 'mc_compose',
+    description:
+      'AI 组合整合包：roles 查看角色预设、plan 按角色/主题生成候选方案（自动过滤已在工程里/不匹配版本的项目并落盘到 build/exports/compose/）、apply 应用方案到工程并解析依赖。' +
+      'Agent 负责给主题与取舍，工具负责检索、去重、校验与落库。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['roles', 'plan', 'apply'], description: '操作类型' },
+        roles: { type: 'array', items: { type: 'string' }, description: '组合角色 id（roles 动作可查看）' },
+        perRole: { type: 'integer', minimum: 1, maximum: 12, description: '每个角色取几个候选（默认按角色预设）' },
+        theme: { type: 'string', description: '主题关键词，会叠加到每个角色的检索里，例如「幻想 中世纪 魔法」' },
+        avoid: { type: 'array', items: { type: 'string' }, description: '排除关键词（slug/标题包含即跳过）' },
+        must: { type: 'array', items: { type: 'string' }, description: '必须包含的项目（slug 或 slug@versionId）' },
+        plan: { type: 'string', description: 'apply 时使用的方案 id 或路径' },
+        refs: { type: 'array', items: { type: 'string' }, description: 'apply 时直接给项目引用（不使用方案文件）' },
+        project: { type: 'string', description: '注册表项目 id；省略则使用当前会话工作目录' },
+        path: { type: 'string', description: '工程文件路径' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const { root, file } = await projectFileFor(exec, args.path, args.project)
+      const planDir = resolvePath(root, 'build/exports/compose')
+
+      if (args.action === 'roles') {
+        const rows = composeRoles().map((role) => [role.id, role.label, role.perRole, role.keywords, role.note ?? ''])
+        return {
+          tool: 'mc_compose',
+          action: 'roles',
+          roles: composeRoles(),
+          text: ['组合角色：', '', formatTable(['id', '角色', '默认数量', '关键词', '说明'], rows), '', '用法：mc_compose action=plan roles=["library","rpg","performance"] theme="幻想 魔法"'].join('\n'),
+        }
+      }
+
+      const project = await readProject(file).catch(() => undefined)
+      if (!project) throw new Error('这一步需要工程文件；先 mc_project action=init 或 create')
+
+      if (args.action === 'plan') {
+        const roles = args.roles?.length ? args.roles : composeRoles().map((role) => role.id)
+        const { plan, path } = await composePlan(config, {
+          project,
+          roles,
+          perRole: args.perRole,
+          theme: args.theme ?? '',
+          avoid: args.avoid ?? [],
+          must: args.must ?? [],
+          planDir,
+        }, exec.signal)
+        let validation = null
+        let validationError = ''
+        try {
+          const refs = plan.entries.map((entry) => entry.slug)
+          if (refs.length) validation = await resolvePlan(config, { refs, gameVersion: project.target.minecraft, loader: project.target.loader, includeOptional: false }, exec.signal)
+        } catch (error) {
+          validationError = error.message
+        }
+        const rows = renderPlanTable(plan).map((row, index) => [index + 1, ...row.slice(0, 3), ...row.slice(4)])
+        const lines = [
+          `AI 组合方案：${plan.id}`,
+          `工程：${project.name} | Minecraft ${project.target.minecraft} / ${project.target.loader} | 主题：${args.theme || '（无）'}`,
+          `候选 ${plan.entries.length} 项 | 方案文件：${path ?? '（未落盘）'}`,
+          '',
+          formatTable(['#', '角色', 'slug', '名称', '客户端/服务端', '更新'], rows),
+        ]
+        if (plan.roleStats.some((stat) => stat.error)) {
+          lines.push('', '检索异常：', ...plan.roleStats.filter((stat) => stat.error).map((stat) => `- ${stat.label}：${stat.error}`))
+        }
+        if (validation) {
+          lines.push('', `依赖校验：闭包 ${validation.entries.length} 项，警告 ${validation.warnings.length}`)
+          if (validation.warnings.length) lines.push(...validation.warnings.slice(0, 8).map((warning) => `- ${warning}`))
+        } else if (validationError) {
+          lines.push('', `依赖校验失败：${validationError}`)
+        }
+        lines.push('', '下一步：mc_compose action=apply plan=<方案 id>，或自行删减后用 mc_mods 增删。')
+        return { tool: 'mc_compose', action: 'plan', plan, path, validation: validation ? { total: validation.entries.length, warnings: validation.warnings } : null, text: lines.join('\n') }
+      }
+
+      // apply
+      let plan
+      let refs = args.refs ?? []
+      if (args.plan) {
+        const loaded = await readComposePlan(planDir, args.plan)
+        plan = loaded.plan
+        refs = plan.entries.map((entry) => entry.slug)
+      }
+      if (!refs.length) throw new Error('apply 需要 plan 或 refs')
+      const { added } = applyComposition(project, { plan, refs })
+      await writeProject(file, project)
+      const resolved = await resolveProject(config, project, exec.signal)
+      const lines = [
+        `已应用组合方案${plan ? `：${plan.id}` : ''}`,
+        `新增/更新：${added.map((mod) => mod.id).join(', ') || '（无变化）'}`,
+        `工程模组数：${project.pack.mods.length} | 依赖闭包：${resolved.entries.length} 项，警告 ${resolved.warnings.length}`,
+      ]
+      if (resolved.warnings.length) lines.push('', ...resolved.warnings.map((warning) => `- ${warning}`))
+      lines.push('', '下一步：mc_client 定制客户端 → mc_export 导出内容 → mc_build 构建整合包。')
+      return { tool: 'mc_compose', action: 'apply', added: added.map((mod) => mod.id), plan: plan?.id, total: resolved.entries.length, warnings: resolved.warnings, text: lines.join('\n') }
+    },
+    render: (_args, value) => value.text,
+  })
+
+  // ---------------------------------------------------------------------------
+  // mc_client — personalized client profile
+  // ---------------------------------------------------------------------------
+  const clientTool = defineTool({
+    name: 'mc_client',
+    description:
+      '个性化客户端：show 查看当前客户端配置、set 修改（内存/JVM 参数/分辨率/画质/语言/按键等）、add-mods / remove-mods 维护客户端专属模组（构建时会以 client-only 打标）、export 生成 options.txt 与启动器配置（JVM 参数 / 说明）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['show', 'set', 'add-mods', 'remove-mods', 'export', 'defaults'], description: '操作类型' },
+        patch: { type: 'object', description: 'set 用的部分配置，例如 {"memory":{"max":"8G"},"graphics":{"renderDistance":16}}' },
+        refs: { type: 'array', items: { type: 'string' }, description: 'add-mods / remove-mods 的项目引用（slug）' },
+        project: { type: 'string', description: '注册表项目 id；省略则使用当前会话工作目录' },
+        path: { type: 'string', description: '工程文件路径' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    async execute(args, exec) {
+      const { root, file } = await projectFileFor(exec, args.path, args.project)
+
+      if (args.action === 'defaults') {
+        return { tool: 'mc_client', action: 'defaults', defaults: CLIENT_DEFAULTS, text: `默认客户端配置：\n\n${JSON.stringify(CLIENT_DEFAULTS, null, 2)}` }
+      }
+
+      const project = await readProject(file)
+      if (args.action === 'show') {
+        const profile = clientProfile(project)
+        return {
+          tool: 'mc_client',
+          action: 'show',
+          profile,
+          text: [
+            `客户端配置：${project.name}`,
+            `内存：${profile.memory.min} - ${profile.memory.max}`,
+            `分辨率：${profile.resolution.width}×${profile.resolution.height}${profile.resolution.fullscreen ? '（全屏）' : ''}`,
+            `画质：视距 ${profile.graphics.renderDistance} / 模拟 ${profile.graphics.simulationDistance} / ${profile.graphics.graphicsMode} / 最高帧 ${profile.graphics.maxFps} / VSync ${profile.graphics.vsync} / GUI 缩放 ${profile.graphics.guiScale}`,
+            `语言：${profile.language}`,
+            `客户端专属模组（${profile.mods.length}）：${profile.mods.join(', ') || '（无）'}`,
+            `资源包：${profile.resourcePacks.join(', ') || '（无）'} | 光影：${profile.shaderPacks.join(', ') || '（无）'}`,
+            `按键自定义：${Object.keys(profile.keybinds).length} 项`,
+            '',
+            '原始配置：',
+            JSON.stringify(profile, null, 2),
+          ].join('\n'),
+        }
+      }
+
+      if (args.action === 'set') {
+        if (!args.patch) throw new Error('set 需要 patch 对象')
+        const profile = updateClientProfile(project, args.patch)
+        await writeProject(file, project)
+        return {
+          tool: 'mc_client',
+          action: 'set',
+          profile,
+          text: `已更新客户端配置：${project.name}\n内存 ${profile.memory.min}-${profile.memory.max} | 视距 ${profile.graphics.renderDistance} | 语言 ${profile.language} | 客户端专属模组 ${profile.mods.length} 个`,
+        }
+      }
+
+      if (args.action === 'add-mods' || args.action === 'remove-mods') {
+        const refs = (args.refs ?? []).filter(Boolean)
+        if (!refs.length) throw new Error(`${args.action} 需要 refs`)
+        const profile = clientProfile(project)
+        const set = new Set(profile.mods)
+        if (args.action === 'add-mods') for (const ref of refs) set.add(ref)
+        else for (const ref of refs) set.delete(ref)
+        updateClientProfile(project, { mods: [...set] })
+        await writeProject(file, project)
+        return {
+          tool: 'mc_client',
+          action: args.action,
+          mods: [...set],
+          text: `客户端专属模组（${set.size}）：${[...set].join(', ') || '（无）'}\n这些模组会在 mc_build 时以 client-only（服务端 unsupported）写入 .mrpack。`,
+        }
+      }
+
+      // export
+      const exportDir = resolvePath(root, 'build/exports/client')
+      const launcherDir = resolvePath(root, 'build/client')
+      const result = await exportClientProfile(project, { exportDir, launcherDir })
+      const content = project.pack.content ?? []
+      if (!content.some((mapping) => mapping.from === 'build/exports/client')) {
+        content.push({ from: 'build/exports/client', to: '', zone: 'overrides', optional: true })
+        project.pack.content = content
+        await writeProject(file, project)
+      }
+      const lines = [
+        `已导出客户端配置：${project.name}`,
+        `随包文件：${exportDir}/options.txt（映射到 overrides/options.txt，首次启动即生效）`,
+        `启动器文件：${launcherDir}/jvm-args.txt、client-profile.md`,
+        `options.txt 条目：${result.optionCount}`,
+        '',
+        '构建后 options.txt 会进入 .mrpack 的 overrides/，JVM 参数需要粘到启动器里（见 client-profile.md）。',
+      ]
+      return { tool: 'mc_client', action: 'export', ...result, text: lines.join('\n') }
+    },
+    render: (_args, value) => value.text,
+  })
+
   const tools = [
     searchTool,
     resourceTool,
@@ -1419,6 +1754,9 @@ export function apply(ctx, rawConfig) {
     designTool,
     exportTool,
     buildTool,
+    marketTool,
+    composeTool,
+    clientTool,
   ]
 
   for (const tool of tools) ctx.tools.register(tool)
